@@ -25,7 +25,7 @@
  *  - Idempotent: a second call returns null without re-patching.
  */
 
-import { IpcEventSource } from './ipc-event-source';
+import { IpcEventSource, setNativeEventSourceFallback, _resetIpcEventSourceFallback } from './ipc-event-source';
 import { ipcFetch } from './ipc-fetch';
 
 interface InstallHandle {
@@ -121,6 +121,11 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   // Patch EventSource. IpcEventSource implements the same interface; a
   // future cross-origin EventSource would surface `bad_path` from the
   // bridge — fix-forward when that consumer appears.
+  //
+  // Hand IpcEventSource the native ctor first: when IPC streaming is
+  // unavailable (dev mode / prod-startup window / unwired backend) it falls
+  // back to a native EventSource, mirroring ipcFetch's HTTP fallback above.
+  setNativeEventSourceFallback(OriginalEventSource);
   (window as unknown as { EventSource: typeof window.EventSource }).EventSource =
     IpcEventSource as unknown as typeof window.EventSource;
 
@@ -131,6 +136,7 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
       window.fetch = originalFetchRef;
       (window as unknown as { EventSource: typeof window.EventSource }).EventSource =
         OriginalEventSource;
+      setNativeEventSourceFallback(undefined);
       installed = false;
     },
   };
@@ -139,4 +145,5 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
 /** Internal — tests reset module state. */
 export function _resetForTests(): void {
   installed = false;
+  _resetIpcEventSourceFallback();
 }

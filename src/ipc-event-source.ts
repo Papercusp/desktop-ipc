@@ -27,6 +27,46 @@ import { dispatchEndpointStreamIpc } from './ipc-stream';
 import type { DispatchEndpointStreamFn } from './types';
 import { SseParser } from './sse-parser';
 
+/**
+ * Native EventSource ctor, captured by the desktop bootstrap *before* it does
+ * `window.EventSource = IpcEventSource`. Used as a graceful fallback when the
+ * Tauri IPC streaming backend is unavailable — the symmetric twin of the
+ * native-HTTP fallback `ipcFetch` already has (see `isIpcUnavailable` in
+ * desktop-bootstrap). Until `endpoint_ipc` is wired on the Rust side (and
+ * during the dev-mode / prod-startup windows the bootstrap documents),
+ * `endpoint_invoke` yields `invoke_failed` / `state not managed`; without
+ * this fallback every SSE consumer (sync, log streams, UI intents) silently
+ * dies on the desktop.
+ */
+let nativeEventSourceCtor: typeof EventSource | undefined;
+
+/**
+ * Latches once IPC streaming proves unavailable this session, so subsequent
+ * EventSources go straight to the native ctor instead of failing and
+ * reconnect-looping on the same dead invoke. Reset only via
+ * `_resetIpcEventSourceFallback` (tests).
+ */
+let ipcStreamingUnavailable = false;
+
+export function setNativeEventSourceFallback(ctor: typeof EventSource | undefined): void {
+  nativeEventSourceCtor = ctor;
+}
+
+/** Test-only reset of the module-level fallback latch + native ctor. */
+export function _resetIpcEventSourceFallback(): void {
+  nativeEventSourceCtor = undefined;
+  ipcStreamingUnavailable = false;
+}
+
+/**
+ * Tauri "command/state not registered" — the IPC backend isn't wired/ready.
+ * Mirrors `isIpcUnavailable` in desktop-bootstrap (kept local to avoid an
+ * import cycle: bootstrap imports this module).
+ */
+function isIpcUnavailableMessage(msg: string): boolean {
+  return msg.includes('invoke_failed') || msg.includes('state not managed');
+}
+
 export interface IpcEventSourceOptions {
   withCredentials?: boolean;
   /** Override the dispatch fn (for tests). Defaults to the real Tauri IPC. */
@@ -61,6 +101,17 @@ export class IpcEventSource extends EventTarget {
     this.url = url.toString();
     this.withCredentials = init?.withCredentials ?? false;
     this.dispatch = init?.dispatch ?? (dispatchEndpointStreamIpc as DispatchEndpointStreamFn);
+    // IPC streaming already proved dead this session → don't reattempt the
+    // doomed invoke; hand back a real native EventSource instead. A
+    // constructor that returns an object makes `new IpcEventSource()` yield
+    // that object (spec-compliant), so consumers get native SSE with zero
+    // event-proxying. Skipped when a dispatch fn is injected (tests / explicit
+    // IPC use) so those paths keep exercising the IPC code.
+    if (ipcStreamingUnavailable && nativeEventSourceCtor && !init?.dispatch) {
+      return new nativeEventSourceCtor(this.url, {
+        withCredentials: this.withCredentials,
+      }) as unknown as IpcEventSource;
+    }
     void this.run();
   }
 
@@ -127,13 +178,23 @@ export class IpcEventSource extends EventTarget {
           this.close();
           return;
         } else if (ev.kind === 'error') {
+          // The unwired/unready backend surfaces here (ipc-stream yields
+          // {kind:'error', code:'invoke_failed'} rather than throwing). Latch
+          // so the resilient wrapper's reconnect builds a native EventSource.
+          if (isIpcUnavailableMessage(`${ev.code} ${ev.message}`)) {
+            ipcStreamingUnavailable = true;
+          }
           this.fireError();
           this.close();
           return;
         }
       }
-    } catch {
+    } catch (err) {
       if (this.readyState !== 2) {
+        // Belt-and-suspenders: if the dispatch ever throws (rather than
+        // yielding an error event) for an unavailable backend, latch too.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isIpcUnavailableMessage(msg)) ipcStreamingUnavailable = true;
         this.fireError();
         this.close();
       }

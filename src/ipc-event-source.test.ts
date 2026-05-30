@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { IpcEventSource } from './ipc-event-source';
+import {
+  IpcEventSource,
+  setNativeEventSourceFallback,
+  _resetIpcEventSourceFallback,
+} from './ipc-event-source';
 import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
 function dispatcherFromQueue(): {
@@ -200,5 +204,44 @@ describe('IpcEventSource', () => {
     expect(es.OPEN).toBe(1);
     expect(es.CLOSED).toBe(2);
     es.close();
+  });
+
+  it('falls back to a native EventSource after IPC streaming proves unavailable', async () => {
+    const created: Array<{ url: string; withCredentials: boolean }> = [];
+    class FakeNativeEventSource {
+      url: string;
+      withCredentials: boolean;
+      constructor(url: string | URL, init?: { withCredentials?: boolean }) {
+        this.url = String(url);
+        this.withCredentials = init?.withCredentials ?? false;
+        created.push({ url: this.url, withCredentials: this.withCredentials });
+      }
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      close(): void {}
+    }
+    setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
+    try {
+      // 1st construction: injected dispatch yields the unwired-backend error
+      // (ipc-stream emits {kind:'error', code:'invoke_failed'}), latching the
+      // module-level "IPC unavailable" flag. The injected-dispatch path itself
+      // must NEVER fall back — it stays an IpcEventSource that errors + closes.
+      const d = dispatcherFromQueue();
+      const es1 = new IpcEventSource('/api/ui/intents/stream', { dispatch: d.dispatch });
+      d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+      await waitFor(() => es1.readyState === 2);
+      expect(es1).toBeInstanceOf(IpcEventSource);
+      expect(created).toHaveLength(0);
+
+      // 2nd construction (no injected dispatch): now hands back a native ES,
+      // preserving url + withCredentials, with zero IPC attempt.
+      const es2 = new IpcEventSource('/api/ui/intents/stream', { withCredentials: true });
+      expect(es2).toBeInstanceOf(FakeNativeEventSource);
+      expect(created).toHaveLength(1);
+      expect(created[0].url).toContain('/api/ui/intents/stream');
+      expect(created[0].withCredentials).toBe(true);
+    } finally {
+      _resetIpcEventSourceFallback();
+    }
   });
 });
