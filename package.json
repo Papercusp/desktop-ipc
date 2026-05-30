@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@papercusp/tooldef": "*",
-    "@restart/sse": "*",
+    "@papercusp/sse": "*",
     "@tauri-apps/api": "*"
   },
   "devDependencies": {
