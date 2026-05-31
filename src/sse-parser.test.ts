@@ -86,4 +86,27 @@ describe('SseParser', () => {
       { type: 'message', data: 'ok', lastEventId: null },
     ]);
   });
+
+  it('treats a lone \\r as a line terminator (HTML SSE spec)', () => {
+    const p = new SseParser();
+    expect(p.feed('data: a\rdata: b\n\n')).toEqual([
+      { type: 'message', data: 'a\nb', lastEventId: null },
+    ]);
+  });
+
+  it('treats \\r\\n as a single line terminator', () => {
+    const p = new SseParser();
+    expect(p.feed('data: a\r\ndata: b\r\n\r\n')).toEqual([
+      { type: 'message', data: 'a\nb', lastEventId: null },
+    ]);
+  });
+
+  it('holds a trailing \\r split across feeds instead of mis-dispatching', () => {
+    const p = new SseParser();
+    // The \r might be the first half of a \r\n — must not terminate yet.
+    expect(p.feed('data: a\r')).toEqual([]);
+    expect(p.feed('\n\n')).toEqual([
+      { type: 'message', data: 'a', lastEventId: null },
+    ]);
+  });
 });
