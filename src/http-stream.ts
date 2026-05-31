@@ -15,7 +15,7 @@
 
 import { parseSseStream } from '@papercusp/sse';
 // Import from the `tool-projection` subpath specifically — the package's
-// root entry re-exports `auth.ts` which pulls `@restart/db-org` → `postgres`
+// root entry re-exports `auth.ts` which pulls `@papercusp/db-org` → `postgres`
 // into the browser bundle (fails "Can't resolve 'fs'"). The subpath is
 // pure zod + the type guard. See packages/agent-mcp/package.json#exports.
 import { isPapercuspBinaryEnvelope } from '@papercusp/tooldef';

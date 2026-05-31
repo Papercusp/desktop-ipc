@@ -23,6 +23,6 @@ HTTP paths share `types` + `sse-parser` and the picker wires both — splitting
 "just the IPC files" would orphan the shared modules.
 
 **Coupling:** none to the Papercusp harness domain — only `@tauri-apps/api`
-(Tauri bridge), `@restart/sse` (SSE chunk parsing), and `@papercusp/tooldef`
+(Tauri bridge), `@papercusp/sse` (SSE chunk parsing), and `@papercusp/tooldef`
 (binary-envelope detection). Any Tauri + WebKitGTK app with a streaming API can
 adopt it.
