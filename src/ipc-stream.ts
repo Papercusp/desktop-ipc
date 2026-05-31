@@ -1,6 +1,6 @@
 /**
  * Tauri IPC transport adapter. Used on desktop when isTauri() returns
- * true AND PAPERCUSP_FORCE_HTTP_TRANSPORT is not set.
+ * true AND the host's force-HTTP escape hatch is not set.
  *
  * Wire path: webview JS → Tauri invoke('endpoint_invoke') → Rust
  * IpcClient → Unix socket / named pipe → Node IPC server →

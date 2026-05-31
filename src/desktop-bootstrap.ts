@@ -13,8 +13,9 @@
  *
  * Scope:
  *  - Only runs in the Tauri webview (`__TAURI_INTERNALS__.invoke` present).
- *  - Skipped if `NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT=1` — same
- *    kill-switch the tool transport picker honors.
+ *  - Skipped when the host's force-HTTP escape hatch is set (see
+ *    `configureDesktopIpc` / `DESKTOP_IPC_FORCE_HTTP`) — same kill-switch
+ *    the tool transport picker honors.
  *  - `fetch` wrapper: same-origin /api/* → ipcFetch; everything else
  *    (cross-origin PostHog/LLM/asset traffic, same-origin non-/api/*)
  *    falls through to the native fetch unchanged.
@@ -25,6 +26,7 @@
  *  - Idempotent: a second call returns null without re-patching.
  */
 
+import { isForceHttp } from './config';
 import { IpcEventSource, setNativeEventSourceFallback, _resetIpcEventSourceFallback } from './ipc-event-source';
 import { ipcFetch } from './ipc-fetch';
 
@@ -40,12 +42,6 @@ function isTauri(): boolean {
     (window as unknown as { __TAURI_INTERNALS__?: { invoke?: unknown } }).__TAURI_INTERNALS__
       ?.invoke,
   );
-}
-
-function forceHttp(): boolean {
-  if (typeof process === 'undefined') return false;
-  const v = process.env?.NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT;
-  return v === '1' || v === 'true';
 }
 
 function isSameOriginApiPath(url: string | URL): boolean {
@@ -84,7 +80,7 @@ function isIpcUnavailable(err: unknown): boolean {
 export function installDesktopIpcPolyfills(): InstallHandle | null {
   if (typeof window === 'undefined') return null;
   if (installed) return null;
-  if (!isTauri() || forceHttp()) return null;
+  if (!isTauri() || isForceHttp()) return null;
 
   // Hold both the original reference (for identity-preserving uninstall)
   // and a bound version (for internal use — Tauri webviews tend to keep

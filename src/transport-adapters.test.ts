@@ -163,11 +163,11 @@ describe('transport picker', () => {
     expect((events[0] as { data: unknown }).data).toBe('ipc');
   });
 
-  it('NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT=1 flips Tauri to HTTP', async () => {
+  it('DESKTOP_IPC_FORCE_HTTP=1 flips Tauri to HTTP', async () => {
     vi.stubGlobal('window', {
       __TAURI_INTERNALS__: { invoke: () => Promise.resolve() },
     } as unknown as Window);
-    vi.stubEnv('NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT', '1');
+    vi.stubEnv('DESKTOP_IPC_FORCE_HTTP', '1');
     vi.doMock('./http-stream', () => ({
       dispatchEndpointStreamHttp: async function* () {
         yield { kind: 'event', name: 'tag', data: 'http' };

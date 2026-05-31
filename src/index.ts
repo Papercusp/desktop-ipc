@@ -16,6 +16,7 @@
  * `dispatchEndpointStreamHttp` directly with `{ overrideUrl: '...' }`.
  */
 
+import { isForceHttp } from './config';
 import { dispatchEndpointStreamHttp } from './http-stream';
 import { dispatchEndpointStreamIpc } from './ipc-stream';
 import type { DispatchEndpointStreamFn } from './types';
@@ -30,17 +31,6 @@ function isTauri(): boolean {
   return Boolean((window as any).__TAURI_INTERNALS__?.invoke);
 }
 
-function forceHttp(): boolean {
-  // Rollback escape hatch — set this in Tauri's app config or the
-  // operator's env to flip every IPC call back to HTTP without
-  // shipping a new Rust binary.
-  if (typeof process !== 'undefined') {
-    const v = process.env?.NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT;
-    if (v === '1' || v === 'true') return true;
-  }
-  return false;
-}
-
 /**
  * Resolved at first call rather than at module-load, so feature-detect
  * survives early script execution before __TAURI_INTERNALS__ is injected.
@@ -48,7 +38,7 @@ function forceHttp(): boolean {
 let cached: DispatchEndpointStreamFn | null = null;
 function resolveTransport(): DispatchEndpointStreamFn {
   if (cached) return cached;
-  cached = !forceHttp() && isTauri()
+  cached = !isForceHttp() && isTauri()
     ? dispatchEndpointStreamIpc
     : dispatchEndpointStreamHttp;
   return cached;
@@ -58,6 +48,7 @@ export const dispatchEndpointStream: DispatchEndpointStreamFn = (toolName, input
   resolveTransport()(toolName, input, options);
 
 export { dispatchEndpointStreamHttp, dispatchEndpointStreamIpc };
+export { configureDesktopIpc, type DesktopIpcConfig } from './config';
 export type {
   EndpointStreamEvent,
   DispatchEndpointStreamOptions,

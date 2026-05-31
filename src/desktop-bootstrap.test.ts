@@ -61,14 +61,14 @@ describe('installDesktopIpcPolyfills', () => {
     expect(installDesktopIpcPolyfills()).toBeNull();
   });
 
-  it('returns null when FORCE_HTTP_TRANSPORT is set', () => {
-    const prev = process.env.NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT;
-    process.env.NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT = '1';
+  it('returns null when the force-HTTP escape hatch is set', () => {
+    const prev = process.env.DESKTOP_IPC_FORCE_HTTP;
+    process.env.DESKTOP_IPC_FORCE_HTTP = '1';
     try {
       expect(installDesktopIpcPolyfills()).toBeNull();
     } finally {
-      if (prev === undefined) delete process.env.NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT;
-      else process.env.NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT = prev;
+      if (prev === undefined) delete process.env.DESKTOP_IPC_FORCE_HTTP;
+      else process.env.DESKTOP_IPC_FORCE_HTTP = prev;
     }
   });
 

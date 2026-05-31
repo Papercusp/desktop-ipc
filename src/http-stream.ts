@@ -1,8 +1,8 @@
 /**
  * HTTP+SSE transport adapter. Used in:
  *   - Non-Tauri browsers (the webapp test surface).
- *   - The Tauri webview when NEXT_PUBLIC_PAPERCUSP_FORCE_HTTP_TRANSPORT
- *     is set (rollback escape hatch).
+ *   - The Tauri webview when the host's force-HTTP escape hatch is set
+ *     (see `configureDesktopIpc` / `DESKTOP_IPC_FORCE_HTTP`).
  *   - MCP-spawned agents (they go through the signed-URL HTTP path
  *     directly, not this helper).
  *
