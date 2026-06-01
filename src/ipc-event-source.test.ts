@@ -168,17 +168,57 @@ describe('IpcEventSource', () => {
     es2.close();
   });
 
-  it('closes cleanly on done', async () => {
+  it('reconnects on done instead of terminating (faithful EventSource)', async () => {
     const d = dispatcherFromQueue();
-    const es = new IpcEventSource('/api/stream', { dispatch: d.dispatch });
+    const es = new IpcEventSource('/api/stream', { dispatch: d.dispatch, reconnectMs: 5 });
+    let errors = 0;
+    let opens = 0;
+    es.onerror = () => { errors++; };
+    es.onopen = () => { opens++; };
     d.push({
       kind: 'event',
       name: 'head',
       data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
     });
-    await waitFor(() => es.readyState === 1);
+    await waitFor(() => opens === 1);
+    expect(es.readyState).toBe(1);
+
+    // Server closes the stream → must reconnect, NOT terminate (the dev-IPC
+    // churn fix). `error` fires, readyState goes CONNECTING (not CLOSED).
     d.push({ kind: 'done', result: { content: [] } });
-    await waitFor(() => es.readyState === 2);
+    await waitFor(() => errors === 1);
+    expect(es.readyState).not.toBe(2);
+
+    // The reconnect dispatch is waiting; a fresh head re-opens it.
+    d.push({
+      kind: 'event',
+      name: 'head',
+      data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    });
+    await waitFor(() => opens === 2);
+    expect(es.readyState).toBe(1);
+
+    // close() is still terminal.
+    es.close();
+    expect(es.readyState).toBe(2);
+  });
+
+  it('forwards Last-Event-ID on reconnect (resume semantics)', async () => {
+    const d = dispatcherFromQueue();
+    const es = new IpcEventSource('/api/stream', { dispatch: d.dispatch, reconnectMs: 5 });
+    d.push({
+      kind: 'event',
+      name: 'head',
+      data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    });
+    d.push({ kind: 'event', name: 'sse-chunk', data: 'id: 42\ndata: a\n\n' });
+    await waitFor(() => (es as any).lastEventId === '42');
+
+    // Drop → reconnect; the reconnect's dispatch must carry Last-Event-ID.
+    d.push({ kind: 'done', result: { content: [] } });
+    await waitFor(() => d.observed.input?.headers?.['Last-Event-ID'] === '42');
+    expect(d.observed.input.headers['Last-Event-ID']).toBe('42');
+    es.close();
   });
 
   it('close() aborts the in-flight dispatch', async () => {

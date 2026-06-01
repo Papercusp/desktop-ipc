@@ -71,6 +71,8 @@ export interface IpcEventSourceOptions {
   withCredentials?: boolean;
   /** Override the dispatch fn (for tests). Defaults to the real Tauri IPC. */
   dispatch?: DispatchEndpointStreamFn;
+  /** Reconnect backoff in ms after a dropped stream (default 2000; tests use a small value). */
+  reconnectMs?: number;
 }
 
 type ReadyState = 0 | 1 | 2;
@@ -95,12 +97,20 @@ export class IpcEventSource extends EventTarget {
   private readonly abort = new AbortController();
   private readonly dispatch: DispatchEndpointStreamFn;
   private lastEventId = '';
+  /**
+   * Reconnect backoff after a dropped stream (native EventSource's default
+   * reconnection time is ~3s; a server `retry:` line could lower it, but we keep
+   * it simple). Short enough that a consumer's open-watchdog (e.g.
+   * DesktopAttentionNotifier's ~4s grace) re-sees OPEN before firing.
+   */
+  private readonly reconnectMs: number;
 
   constructor(url: string | URL, init?: IpcEventSourceOptions) {
     super();
     this.url = url.toString();
     this.withCredentials = init?.withCredentials ?? false;
     this.dispatch = init?.dispatch ?? (dispatchEndpointStreamIpc as DispatchEndpointStreamFn);
+    this.reconnectMs = init?.reconnectMs ?? 2000;
     // IPC streaming already proved dead this session → don't reattempt the
     // doomed invoke; hand back a real native EventSource instead. A
     // constructor that returns an object makes `new IpcEventSource()` yield
@@ -132,7 +142,34 @@ export class IpcEventSource extends EventTarget {
     }
   }
 
+  /**
+   * Reconnect loop — IpcEventSource is a FAITHFUL EventSource: a dropped stream
+   * (server close / `done` / a transient error) reconnects with `Last-Event-ID`
+   * instead of terminating, exactly like the native `EventSource`. This is the
+   * fix for the dev-IPC reconnect churn (the flashing): the one-shot version
+   * `close()`d on every drop, so a consumer's resilient wrapper recreated us —
+   * and each recreate is a brand-new IPC channel + a sync-layer re-subscribe +
+   * re-render. Auto-reconnecting keeps `readyState` at CONNECTING (not CLOSED)
+   * across a drop, so a spec-correct consumer leaves us alone. Terminal ONLY on
+   * `close()` (consumer) or a fatal head / IPC-unavailable backend.
+   * Plan: calltool-endpoint-seam-2026-06-01 (Phase D, P-007).
+   */
   private async run(): Promise<void> {
+    while (this.readyState !== 2) {
+      const outcome = await this.runOnce();
+      if (outcome === 'fatal' || this.readyState === 2) return;
+      // Dropped → reconnect like native EventSource: go back to CONNECTING (NOT
+      // closed), fire `error` (native fires it on disconnect), brief backoff,
+      // re-open. A consumer that recreates only on CLOSED sees CONNECTING and
+      // does nothing — no churn.
+      this.readyState = 0;
+      this.fireError();
+      await this.delay(this.reconnectMs);
+    }
+  }
+
+  /** One connection attempt. 'fatal' → already `close()`d, stop. 'drop' → reconnect. */
+  private async runOnce(): Promise<'fatal' | 'drop'> {
     const headers: Record<string, string> = { accept: 'text/event-stream' };
     if (this.lastEventId) headers['Last-Event-ID'] = this.lastEventId;
 
@@ -142,7 +179,7 @@ export class IpcEventSource extends EventTarget {
         { method: 'GET', path: this.pathFromUrl(), headers },
         { signal: this.abort.signal },
       )) {
-        if (this.readyState === 2) break;
+        if (this.readyState === 2) return 'fatal';
 
         if (ev.kind === 'event' && ev.name === 'head') {
           const head = ev.data as { status: number; headers: Record<string, string> };
@@ -153,9 +190,11 @@ export class IpcEventSource extends EventTarget {
             this.dispatchEvent(open);
             this.onopen?.call(this, open);
           } else {
+            // Non-2xx / wrong content-type is a real failure — native
+            // EventSource also gives up on a non-2xx response. Terminal.
             this.fireError();
             this.close();
-            return;
+            return 'fatal';
           }
         } else if (
           ev.kind === 'event' &&
@@ -175,30 +214,56 @@ export class IpcEventSource extends EventTarget {
             if (p.type === 'message') this.onmessage?.call(this, msg);
           }
         } else if (ev.kind === 'done') {
-          this.close();
-          return;
+          // Server closed the stream → reconnect (native EventSource semantics).
+          return 'drop';
         } else if (ev.kind === 'error') {
           // The unwired/unready backend surfaces here (ipc-stream yields
-          // {kind:'error', code:'invoke_failed'} rather than throwing). Latch
-          // so the resilient wrapper's reconnect builds a native EventSource.
+          // {kind:'error', code:'invoke_failed'} rather than throwing). That is
+          // FATAL — latch so the next EventSource builds a native one (HTTP
+          // fallback). A non-IPC-unavailable error is a transient drop → reconnect.
           if (isIpcUnavailableMessage(`${ev.code} ${ev.message}`)) {
             ipcStreamingUnavailable = true;
+            this.fireError();
+            this.close();
+            return 'fatal';
           }
-          this.fireError();
-          this.close();
-          return;
+          return 'drop';
         }
       }
+      // Iterator completed without `done`/`error` (stream ended) → reconnect.
+      return 'drop';
     } catch (err) {
-      if (this.readyState !== 2) {
-        // Belt-and-suspenders: if the dispatch ever throws (rather than
-        // yielding an error event) for an unavailable backend, latch too.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (isIpcUnavailableMessage(msg)) ipcStreamingUnavailable = true;
+      if (this.readyState === 2) return 'fatal';
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isIpcUnavailableMessage(msg)) {
+        // Unavailable backend that threw rather than yielding an error → latch + terminal.
+        ipcStreamingUnavailable = true;
         this.fireError();
         this.close();
+        return 'fatal';
       }
+      // Transient throw → reconnect.
+      return 'drop';
     }
+  }
+
+  /** Abortable backoff — resolves early when the source is `close()`d. */
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.abort.signal.aborted) {
+        resolve();
+        return;
+      }
+      const t = setTimeout(resolve, ms);
+      this.abort.signal.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(t);
+          resolve();
+        },
+        { once: true },
+      );
+    });
   }
 
   private fireError(): void {
