@@ -49,6 +49,10 @@ export const dispatchEndpointStream: DispatchEndpointStreamFn = (toolName, input
 
 export { dispatchEndpointStreamHttp, dispatchEndpointStreamIpc };
 export { configureDesktopIpc, type DesktopIpcConfig } from './config';
+// The EventSource-over-IPC class. The desktop bootstrap installs it as
+// `window.EventSource`; also exported for direct use + cross-layer tests.
+export { IpcEventSource, type IpcEventSourceOptions } from './ipc-event-source';
+export { ipcFetch, type IpcFetchOptions } from './ipc-fetch';
 export type {
   EndpointStreamEvent,
   DispatchEndpointStreamOptions,
