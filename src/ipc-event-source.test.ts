@@ -4,6 +4,7 @@ import {
   setNativeEventSourceFallback,
   _resetIpcEventSourceFallback,
 } from './ipc-event-source';
+import { setIpcInspector, type IpcTraceEvent } from './ipc-inspector';
 import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
 function dispatcherFromQueue(): {
@@ -237,6 +238,40 @@ describe('IpcEventSource', () => {
     await waitFor(() => d.observed.input?.headers?.['Last-Event-ID'] === '42');
     expect(d.observed.input.headers['Last-Event-ID']).toBe('42');
     es.close();
+  });
+
+  it('emits inspector traces: ONE es-open across a reconnect (the churn signal)', async () => {
+    const traces: IpcTraceEvent[] = [];
+    setIpcInspector((ev) => { if (ev.kind.startsWith('es-')) traces.push(ev); });
+    try {
+      const d = dispatcherFromQueue();
+      const es = new IpcEventSource('/api/zero-harness/sse', { dispatch: d.dispatch, reconnectMs: 5 });
+      // Construction trace fires synchronously.
+      expect(traces.filter((t) => t.kind === 'es-open')).toHaveLength(1);
+
+      d.push({ kind: 'event', name: 'head', data: { status: 200, headers: { 'content-type': 'text/event-stream' } } });
+      await waitFor(() => traces.some((t) => t.kind === 'es-connect'));
+
+      // Server closes → es-drop, then the SAME source auto-reconnects (NO new es-open).
+      d.push({ kind: 'done', result: { content: [] } });
+      await waitFor(() => traces.some((t) => t.kind === 'es-drop'));
+      d.push({ kind: 'event', name: 'head', data: { status: 200, headers: { 'content-type': 'text/event-stream' } } });
+      await waitFor(() => traces.filter((t) => t.kind === 'es-connect').length === 2);
+
+      es.close();
+      d.close();
+      await waitFor(() => traces.some((t) => t.kind === 'es-close'));
+
+      // The whole point: ONE construction, TWO connects → a persistent stream
+      // that reconnected internally, NOT a wrapper churning new channels.
+      expect(traces.filter((t) => t.kind === 'es-open')).toHaveLength(1);
+      expect(traces.filter((t) => t.kind === 'es-connect')).toHaveLength(2);
+      expect(traces.filter((t) => t.kind === 'es-drop')).toHaveLength(1);
+      // All lifecycle events share one correlation id.
+      expect(new Set(traces.map((t) => t.id)).size).toBe(1);
+    } finally {
+      setIpcInspector(null);
+    }
   });
 
   it('close() aborts the in-flight dispatch', async () => {

@@ -17,6 +17,7 @@ import type {
   EndpointStreamEvent,
   DispatchEndpointStreamOptions,
 } from './types';
+import { emitIpcTrace, nextIpcTraceId } from './ipc-inspector';
 
 /** Wire shape on the JS side of the Tauri Channel<EndpointEvent>. */
 type RustEndpointEvent =
@@ -56,6 +57,13 @@ export async function* dispatchEndpointStreamIpc<TInput>(
   let wake: (() => void) | null = null;
   let done = false;
 
+  // Inspector seam (dev-only; zero-cost when no inspector installed). For the
+  // sys:http bridge, `input` carries {method, path}; for direct dispatch it's
+  // the tool's own input, so path/method are simply absent.
+  const traceId = nextIpcTraceId();
+  const inp = input as { path?: string; method?: string } | undefined;
+  emitIpcTrace({ kind: 'invoke', id: traceId, tool: toolName, path: inp?.path, method: inp?.method });
+
   const channel = new Channel<RustEndpointEvent>();
   channel.onmessage = (msg) => {
     if (msg.kind === 'binary') {
@@ -78,11 +86,9 @@ export async function* dispatchEndpointStreamIpc<TInput>(
       channel,
     });
   } catch (err) {
-    yield {
-      kind: 'error',
-      code: 'invoke_failed',
-      message: err instanceof Error ? err.message : String(err),
-    };
+    const message = err instanceof Error ? err.message : String(err);
+    emitIpcTrace({ kind: 'invoke-error', id: traceId, tool: toolName, detail: `invoke_failed: ${message}` });
+    yield { kind: 'error', code: 'invoke_failed', message };
     return;
   }
 
@@ -105,6 +111,13 @@ export async function* dispatchEndpointStreamIpc<TInput>(
       }
       while (queue.length > 0) {
         const ev = queue.shift()!;
+        if (ev.kind === 'done' || ev.kind === 'error') {
+          emitIpcTrace(
+            ev.kind === 'error'
+              ? { kind: 'invoke-error', id: traceId, tool: toolName, detail: ev.code }
+              : { kind: 'invoke-done', id: traceId, tool: toolName },
+          );
+        }
         yield ev;
         if (ev.kind === 'done' || ev.kind === 'error') return;
       }

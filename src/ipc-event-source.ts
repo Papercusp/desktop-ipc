@@ -26,6 +26,7 @@
 import { dispatchEndpointStreamIpc } from './ipc-stream';
 import type { DispatchEndpointStreamFn } from './types';
 import { SseParser } from './sse-parser';
+import { emitIpcTrace, nextIpcTraceId } from './ipc-inspector';
 
 /**
  * Native EventSource ctor, captured by the desktop bootstrap *before* it does
@@ -104,6 +105,8 @@ export class IpcEventSource extends EventTarget {
    * DesktopAttentionNotifier's ~4s grace) re-sees OPEN before firing.
    */
   private readonly reconnectMs: number;
+  /** Inspector correlation id — shared by every lifecycle event of THIS source. */
+  private readonly traceId = nextIpcTraceId();
 
   constructor(url: string | URL, init?: IpcEventSourceOptions) {
     super();
@@ -122,12 +125,17 @@ export class IpcEventSource extends EventTarget {
         withCredentials: this.withCredentials,
       }) as unknown as IpcEventSource;
     }
+    // A genuine IpcEventSource construction = a NEW IPC channel. The COUNT of
+    // these per URL is the churn metric: >1 for a long-lived stream means a
+    // consumer is recreating us instead of letting us auto-reconnect.
+    emitIpcTrace({ kind: 'es-open', id: this.traceId, path: this.url });
     void this.run();
   }
 
   close(): void {
     if (this.readyState === 2) return;
     this.readyState = 2;
+    emitIpcTrace({ kind: 'es-close', id: this.traceId, path: this.url });
     this.abort.abort();
   }
 
@@ -145,6 +153,7 @@ export class IpcEventSource extends EventTarget {
   private terminate(): void {
     if (this.readyState === 2) return;
     this.readyState = 2;
+    emitIpcTrace({ kind: 'es-error', id: this.traceId, path: this.url });
     const ev = new Event('error');
     this.dispatchEvent(ev);
     this.onerror?.call(this, ev);
@@ -181,7 +190,10 @@ export class IpcEventSource extends EventTarget {
       // Dropped → reconnect like native EventSource: go back to CONNECTING (NOT
       // closed), fire `error` (native fires it on disconnect), brief backoff,
       // re-open. A consumer that recreates only on CLOSED sees CONNECTING and
-      // does nothing — no churn.
+      // does nothing — no churn. The trace pairs `es-drop`/`es-connect` WITHOUT
+      // a new `es-open`, which is exactly how the inspector distinguishes a
+      // healthy internal reconnect from a wrapper recreating the source.
+      emitIpcTrace({ kind: 'es-drop', id: this.traceId, path: this.url });
       this.readyState = 0;
       this.fireError();
       await this.delay(this.reconnectMs);
@@ -206,6 +218,7 @@ export class IpcEventSource extends EventTarget {
           const ct = String(head.headers?.['content-type'] ?? '').toLowerCase();
           if (head.status === 200 && ct.includes('text/event-stream')) {
             this.readyState = 1;
+            emitIpcTrace({ kind: 'es-connect', id: this.traceId, path: this.url });
             const open = new Event('open');
             this.dispatchEvent(open);
             this.onopen?.call(this, open);

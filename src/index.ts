@@ -54,3 +54,17 @@ export type {
   DispatchEndpointStreamOptions,
   DispatchEndpointStreamFn,
 } from './types';
+
+// IPC traffic inspector (dev-only observability seam). The app's dev bootstrap
+// installs a recorder via `setIpcInspector`; production leaves it unset so the
+// in-transport hooks stay no-ops. Plan: calltool-endpoint-seam (Phase C).
+export {
+  setIpcInspector,
+  isIpcInspectorEnabled,
+  // Producer side of the seam (transport authors / instrumentation tests emit).
+  emitIpcTrace,
+  nextIpcTraceId,
+  type IpcTraceEvent,
+  type IpcTraceKind,
+  type IpcInspectorFn,
+} from './ipc-inspector';
