@@ -131,6 +131,26 @@ export class IpcEventSource extends EventTarget {
     this.abort.abort();
   }
 
+  /**
+   * Terminal failure: set readyState CLOSED *then* fire `error` — faithful to a
+   * native EventSource, which sets CLOSED before its give-up `error`. The order
+   * is load-bearing for a recreate-on-CLOSED consumer
+   * (`createResilientEventSource`): it inspects readyState in its error handler
+   * to tell a transient drop (CONNECTING → leave us to auto-reconnect) from a
+   * death (CLOSED → rebuild, which on the IPC-unavailable latch yields a native
+   * EventSource fallback). Firing error *before* close() would show CONNECTING,
+   * so the consumer would wait forever for a reconnect that can't happen.
+   * Idempotent. Plan: calltool-endpoint-seam-2026-06-01 (Phase D, P-007).
+   */
+  private terminate(): void {
+    if (this.readyState === 2) return;
+    this.readyState = 2;
+    const ev = new Event('error');
+    this.dispatchEvent(ev);
+    this.onerror?.call(this, ev);
+    this.abort.abort();
+  }
+
   private pathFromUrl(): string {
     try {
       const base =
@@ -191,9 +211,9 @@ export class IpcEventSource extends EventTarget {
             this.onopen?.call(this, open);
           } else {
             // Non-2xx / wrong content-type is a real failure — native
-            // EventSource also gives up on a non-2xx response. Terminal.
-            this.fireError();
-            this.close();
+            // EventSource also gives up on a non-2xx response. Terminal
+            // (readyState CLOSED before the error, so a wrapper rebuilds).
+            this.terminate();
             return 'fatal';
           }
         } else if (
@@ -223,8 +243,7 @@ export class IpcEventSource extends EventTarget {
           // fallback). A non-IPC-unavailable error is a transient drop → reconnect.
           if (isIpcUnavailableMessage(`${ev.code} ${ev.message}`)) {
             ipcStreamingUnavailable = true;
-            this.fireError();
-            this.close();
+            this.terminate();
             return 'fatal';
           }
           return 'drop';
@@ -238,8 +257,7 @@ export class IpcEventSource extends EventTarget {
       if (isIpcUnavailableMessage(msg)) {
         // Unavailable backend that threw rather than yielding an error → latch + terminal.
         ipcStreamingUnavailable = true;
-        this.fireError();
-        this.close();
+        this.terminate();
         return 'fatal';
       }
       // Transient throw → reconnect.

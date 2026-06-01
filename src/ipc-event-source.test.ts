@@ -109,6 +109,24 @@ describe('IpcEventSource', () => {
     expect(es.readyState).toBe(2);
   });
 
+  it('sets readyState CLOSED *before* firing a fatal error (recreate-on-CLOSED contract)', async () => {
+    // createResilientEventSource inspects readyState in its error handler to
+    // tell a transient drop (CONNECTING → leave us to auto-reconnect) from a
+    // death (CLOSED → rebuild, which on the IPC-unavailable latch yields the
+    // native fallback). A fatal must therefore present CLOSED *at* error time.
+    const d = dispatcherFromQueue();
+    const es = new IpcEventSource('/api/foo', { dispatch: d.dispatch });
+    let stateAtError = -1;
+    es.onerror = () => { stateAtError = es.readyState; };
+    d.push({
+      kind: 'event',
+      name: 'head',
+      data: { status: 503, headers: { 'content-type': 'text/event-stream' } },
+    });
+    await waitFor(() => stateAtError !== -1);
+    expect(stateAtError).toBe(2); // CLOSED when the handler runs, not after
+  });
+
   it('parses sse-chunk events into MessageEvents on the correct type', async () => {
     const d = dispatcherFromQueue();
     const es = new IpcEventSource('/api/stream', { dispatch: d.dispatch });
