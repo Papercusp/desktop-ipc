@@ -14,6 +14,8 @@ function aborting(): DispatchEndpointStreamFn {
   };
 }
 
+const dec = new TextDecoder();
+
 describe('ipcFetch', () => {
   it('reassembles head + body chunks into a Response', async () => {
     const dispatch = dispatcher([
@@ -82,6 +84,14 @@ describe('ipcFetch', () => {
     await expect(ipcFetch('/api/x', {}, { dispatch })).rejects.toThrow(/head event/);
   });
 
+  it('rejects synchronously when handed an already-aborted signal', async () => {
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await expect(
+      ipcFetch('/api/x', { signal: ctrl.signal }, { dispatch: dispatcher([]) }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
   it('forwards method, headers, and string body to the bridge', async () => {
     const observed: { toolName?: string; input?: unknown } = {};
     const dispatch: DispatchEndpointStreamFn = async function* (toolName, input) {
@@ -119,9 +129,10 @@ describe('ipcFetch', () => {
     ).rejects.toThrow(/string request bodies/);
   });
 
-  it('falls back to appending SSE chunks as bytes when the response is text/event-stream', async () => {
-    // Caller asked for SSE through ipcFetch (wrong tool — should use
-    // IpcEventSource), but we degrade gracefully and concat the wire bytes.
+  it('streams an SSE (text/event-stream) response body as bytes', async () => {
+    // SSE-over-POST can't use IpcEventSource (that's GET-only), so the
+    // oracle/agent-chat bubbles read this body incrementally via
+    // res.body.getReader(). The whole wire output must round-trip.
     const dispatch = dispatcher([
       {
         kind: 'event',
@@ -134,5 +145,67 @@ describe('ipcFetch', () => {
     ]);
     const res = await ipcFetch('/api/stream', {}, { dispatch });
     expect(await res.text()).toBe('data: a\n\ndata: b\n\n');
+  });
+
+  it('streams sse-chunks incrementally — Response resolves at head, chunks arrive one at a time', async () => {
+    // The regression this guards: the prior impl buffered the whole SSE
+    // response to DONE before resolving the Response, so chat replies
+    // rendered all at once. The body must now yield each sse-chunk
+    // separately, before DONE.
+    const dispatch = dispatcher([
+      {
+        kind: 'event',
+        name: 'head',
+        data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      },
+      { kind: 'event', name: 'sse-chunk', data: 'data: a\n\n' },
+      { kind: 'event', name: 'sse-chunk', data: 'data: b\n\n' },
+      { kind: 'done', result: { content: [] } },
+    ]);
+    const res = await ipcFetch('/api/stream', {}, { dispatch });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    expect(dec.decode((await reader.read()).value)).toBe('data: a\n\n');
+    expect(dec.decode((await reader.read()).value)).toBe('data: b\n\n');
+    expect((await reader.read()).done).toBe(true);
+  });
+
+  it('errors the body stream on a mid-stream error after head', async () => {
+    const dispatch = dispatcher([
+      {
+        kind: 'event',
+        name: 'head',
+        data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      },
+      { kind: 'event', name: 'sse-chunk', data: 'data: a\n\n' },
+      { kind: 'error', code: 'stream_error', message: 'boom' },
+    ]);
+    const res = await ipcFetch('/api/stream', {}, { dispatch });
+    const reader = res.body!.getReader();
+    expect(dec.decode((await reader.read()).value)).toBe('data: a\n\n');
+    await expect(reader.read()).rejects.toThrow(/stream_error/);
+  });
+
+  it('cancelling the body aborts the upstream call (no leaked spawn)', async () => {
+    let captured: AbortSignal | undefined;
+    const dispatch: DispatchEndpointStreamFn = async function* (_t, _i, options) {
+      captured = options?.signal;
+      yield {
+        kind: 'event',
+        name: 'head',
+        data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      };
+      yield { kind: 'event', name: 'sse-chunk', data: 'data: a\n\n' };
+      // Hang until aborted so the consumer can cancel mid-stream.
+      await new Promise<void>((resolve) => {
+        if (captured?.aborted) resolve();
+        else captured?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    };
+    const res = await ipcFetch('/api/stream', {}, { dispatch });
+    const reader = res.body!.getReader();
+    expect(dec.decode((await reader.read()).value)).toBe('data: a\n\n');
+    await reader.cancel();
+    expect(captured?.aborted).toBe(true);
   });
 });

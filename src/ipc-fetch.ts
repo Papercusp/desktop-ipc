@@ -7,6 +7,25 @@
  * these calls don't compete against the browser's per-host connection
  * pool with the long-lived SSE streams.
  *
+ * Streaming: the returned `Response` has a live `ReadableStream` body.
+ * The `head` event resolves the `Response` (status + headers); each
+ * subsequent `sse-chunk` (text/event-stream) or `body` (binary) event is
+ * enqueued into the body stream **as it arrives**. So a POST consumer
+ * that does `fetch(...).then(r => r.body.getReader())` — e.g. the oracle
+ * and agent-chat bubbles, which can't use `IpcEventSource` because SSE
+ * over POST isn't an `EventSource` — streams deltas incrementally on the
+ * desktop, exactly as it would over plain HTTP. (The earlier version
+ * buffered the whole response to `DONE` before resolving, which made
+ * those chats render their reply all at once after generation finished.)
+ * Non-streaming JSON callers (`await r.json()` / `r.text()`) drain the
+ * stream transparently and are unaffected.
+ *
+ * The stream is pull-based, so it honors consumer backpressure and never
+ * buffers ahead of what the consumer reads. Cancelling the body
+ * (`reader.cancel()` / a discarded `Response`) aborts the upstream call,
+ * so closing a chat mid-stream tears down the server-side agent spawn
+ * instead of leaking it.
+ *
  * Phase 1 scope: string bodies only. Binary request bodies (ArrayBuffer,
  * Blob, FormData with files, ReadableStream) throw — the bridge has the
  * mechanism (the wire's `body` slot accepts strings; raw bytes need an
@@ -14,11 +33,15 @@
  * extend when one does.
  *
  * `aborted` and `upstream_error` from the bridge become a thrown
- * `AbortError` (matching native fetch) and a `TypeError`, respectively.
+ * `AbortError` (matching native fetch) and a `TypeError`, respectively —
+ * before `head` they reject the `ipcFetch` promise; after `head` (i.e.
+ * mid-body) they error the body stream so the consumer's pending
+ * `read()` rejects, matching how native fetch surfaces a dropped
+ * response body.
  */
 
 import { dispatchEndpointStreamIpc } from './ipc-stream';
-import type { DispatchEndpointStreamFn } from './types';
+import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
 export interface IpcFetchOptions {
   /** Override the dispatch fn (for tests). Defaults to the real Tauri IPC. */
@@ -37,6 +60,66 @@ function pathFromUrl(url: string): string {
   } catch {
     return url;
   }
+}
+
+function terminalError(code: string, message: string): Error {
+  if (code === 'aborted') {
+    return new DOMException(message || 'aborted', 'AbortError');
+  }
+  return new TypeError(`ipcFetch failed [${code}]: ${message}`);
+}
+
+/**
+ * Build the body `ReadableStream` that continues draining the IPC event
+ * iterator from right after the `head` event. Pull-based: one
+ * `iterator.next()` per `pull`, enqueuing exactly one chunk (or
+ * closing/erroring), so consumer backpressure naturally paces the bridge.
+ */
+function makeBodyStream(
+  iterator: AsyncIterator<EndpointStreamEvent>,
+  abort: AbortController,
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        // Loop past non-body events (a stray 'event'/extra 'head') until we
+        // enqueue one chunk or hit a terminal.
+        for (;;) {
+          const { value: ev, done } = await iterator.next();
+          if (done) {
+            controller.close();
+            return;
+          }
+          if (ev.kind === 'binary' && ev.name === 'body') {
+            controller.enqueue(ev.data);
+            return;
+          }
+          if (ev.kind === 'event' && ev.name === 'sse-chunk' && typeof ev.data === 'string') {
+            controller.enqueue(encoder.encode(ev.data));
+            return;
+          }
+          if (ev.kind === 'done') {
+            controller.close();
+            return;
+          }
+          if (ev.kind === 'error') {
+            controller.error(terminalError(ev.code, ev.message));
+            return;
+          }
+          // Unknown/non-body event — keep pulling.
+        }
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+    cancel() {
+      // Consumer cancelled the body → abort the upstream call and let the
+      // generator run its finally (which sends a CANCEL frame).
+      abort.abort();
+      void iterator.return?.(undefined);
+    },
+  });
 }
 
 export async function ipcFetch(
@@ -65,6 +148,21 @@ export async function ipcFetch(
     );
   }
 
+  const callerSignal = init.signal ?? undefined;
+  // Native fetch rejects synchronously when handed an already-aborted signal.
+  if (callerSignal?.aborted) {
+    throw new DOMException('request aborted', 'AbortError');
+  }
+
+  // Combine the caller's signal with an internal controller so cancelling
+  // the Response body stream (`reader.cancel()`) aborts the upstream call —
+  // otherwise closing a chat mid-stream would leak the server-side agent
+  // spawn that's still producing tokens.
+  const abort = new AbortController();
+  if (callerSignal) {
+    callerSignal.addEventListener('abort', () => abort.abort(), { once: true });
+  }
+
   const ipcInput = {
     method: init.method ?? 'GET',
     path,
@@ -72,53 +170,31 @@ export async function ipcFetch(
     body,
   };
 
-  let head: { status: number; headers: Record<string, string> } | null = null;
-  const bodyChunks: Uint8Array[] = [];
-  let terminal: { code: string; message: string } | null = null;
+  const iterator = dispatch('sys:http', ipcInput, { signal: abort.signal })[
+    Symbol.asyncIterator
+  ]();
 
-  const signal = init.signal ?? undefined;
-
-  for await (const ev of dispatch('sys:http', ipcInput, { signal: signal ?? undefined })) {
+  // Pull events until the first `head`. The server always sends `head`
+  // before any body chunk; a terminal before `head` is an error (or the
+  // "no head" case the prior buffering impl surfaced as a TypeError).
+  for (;;) {
+    const { value: ev, done } = await iterator.next();
+    if (done) {
+      throw new TypeError('ipcFetch: stream ended without a head event');
+    }
     if (ev.kind === 'event' && ev.name === 'head') {
-      head = ev.data as { status: number; headers: Record<string, string> };
-    } else if (ev.kind === 'binary' && ev.name === 'body') {
-      bodyChunks.push(ev.data);
-    } else if (ev.kind === 'event' && ev.name === 'sse-chunk' && typeof ev.data === 'string') {
-      // The bridge routed an SSE response through here. Callers wanting
-      // SSE should use IpcEventSource, but degrade gracefully: append
-      // each chunk as bytes so the assembled Response body still holds
-      // the full wire output.
-      bodyChunks.push(new TextEncoder().encode(ev.data));
-    } else if (ev.kind === 'done') {
-      break;
-    } else if (ev.kind === 'error') {
-      terminal = { code: ev.code, message: ev.message };
-      break;
+      const head = ev.data as { status: number; headers: Record<string, string> };
+      return new Response(makeBodyStream(iterator, abort), {
+        status: head.status,
+        headers: head.headers,
+      });
     }
-  }
-
-  if (terminal) {
-    if (terminal.code === 'aborted') {
-      throw new DOMException(terminal.message || 'aborted', 'AbortError');
+    if (ev.kind === 'done') {
+      throw new TypeError('ipcFetch: stream ended without a head event');
     }
-    throw new TypeError(`ipcFetch failed [${terminal.code}]: ${terminal.message}`);
+    if (ev.kind === 'error') {
+      throw terminalError(ev.code, ev.message);
+    }
+    // A body chunk before `head` shouldn't happen — ignore and keep reading.
   }
-  if (!head) {
-    throw new TypeError('ipcFetch: stream ended without a head event');
-  }
-
-  // Reassemble body bytes.
-  let total = 0;
-  for (const c of bodyChunks) total += c.length;
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const c of bodyChunks) {
-    bytes.set(c, offset);
-    offset += c.length;
-  }
-
-  return new Response(bytes, {
-    status: head.status,
-    headers: head.headers,
-  });
 }
