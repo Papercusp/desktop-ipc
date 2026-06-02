@@ -43,9 +43,50 @@
 import { dispatchEndpointStreamIpc } from './ipc-stream';
 import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
+export interface IpcFetchRetryOptions {
+  /** Number of retries (additional attempts beyond the first) for an
+   *  idempotent request that fails pre-head with `connection_lost`.
+   *  Defaults to `backoffMs.length`. */
+  attempts?: number;
+  /** Per-retry backoff in ms; the attempt index is clamped to the last
+   *  entry. Defaults to {@link DEFAULT_RETRY_BACKOFF_MS}. */
+  backoffMs?: number[];
+  /** Injectable delay (tests pass a no-op). Honors the caller's signal. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
+
 export interface IpcFetchOptions {
   /** Override the dispatch fn (for tests). Defaults to the real Tauri IPC. */
   dispatch?: DispatchEndpointStreamFn;
+  /** Tune/disable the transparent `connection_lost` retry. */
+  retry?: IpcFetchRetryOptions;
+}
+
+/** The only error code retried transparently: the IPC socket dropped (most
+ *  often the operator/sidecar restarting) while a call was in flight. The
+ *  reconnecting Rust `IpcClientHandle` re-opens on the next invoke, so the
+ *  retry rides the fresh connection. Every other terminal code means IPC
+ *  *did* run (a real HTTP/handler outcome) and must NOT be replayed. */
+const RETRYABLE_ERROR_CODE = 'connection_lost';
+
+/** Default backoff schedule — short enough not to hang a loading spinner,
+ *  long enough to span a reader-loop reconnect (~120ms observed) and a
+ *  quick sidecar bounce. ~1.55s total across 3 retries. */
+const DEFAULT_RETRY_BACKOFF_MS = [150, 400, 1000];
+
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }
 
 function pathFromUrl(url: string): string {
@@ -170,31 +211,72 @@ export async function ipcFetch(
     body,
   };
 
-  const iterator = dispatch('sys:http', ipcInput, { signal: abort.signal })[
-    Symbol.asyncIterator
-  ]();
+  // A dropped IPC socket — most often the operator/sidecar restarting, whose
+  // Rust reader loop fires `connection_lost` at every in-flight call — is
+  // transient: the reconnecting `IpcClientHandle` re-opens on the next
+  // invoke. So for an idempotent request that fails *before any response
+  // body is delivered*, we transparently re-dispatch; the retry rides the
+  // fresh connection. Without this, a restart landing mid-load fails the
+  // whole batch of concurrent reads (e.g. the /adv Plans tab "loading a lot
+  // of things") with a hard error only a manual refresh clears.
+  //
+  // Three guards keep the replay safe:
+  //  - Idempotent methods only (GET/HEAD). A mutation may have been applied
+  //    server-side before the drop, so it's never silently replayed — the
+  //    error surfaces and the user retries deliberately.
+  //  - Pre-head only. Once `head` resolves the Response, bytes may already
+  //    be in the consumer's hands; a mid-body drop errors the stream
+  //    (makeBodyStream) — it can't be transparently re-run.
+  //  - `connection_lost` only (not `invoke_failed`). `invoke_failed` means
+  //    the IPC backend is absent (dev no-sidecar / prod pre-handshake) and
+  //    is handled by the patched-fetch HTTP fallback — retrying it here
+  //    would make dev mode eat a backoff on every /api call.
+  const method = (init.method ?? 'GET').toUpperCase();
+  const idempotent = method === 'GET' || method === 'HEAD';
+  const backoffMs = opts.retry?.backoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
+  const maxRetries = idempotent ? opts.retry?.attempts ?? backoffMs.length : 0;
+  const sleep = opts.retry?.sleep ?? defaultSleep;
 
-  // Pull events until the first `head`. The server always sends `head`
-  // before any body chunk; a terminal before `head` is an error (or the
-  // "no head" case the prior buffering impl surfaced as a TypeError).
-  for (;;) {
-    const { value: ev, done } = await iterator.next();
-    if (done) {
-      throw new TypeError('ipcFetch: stream ended without a head event');
+  for (let attempt = 0; ; attempt++) {
+    const iterator = dispatch('sys:http', ipcInput, { signal: abort.signal })[
+      Symbol.asyncIterator
+    ]();
+
+    // Pull events until the first `head`. The server always sends `head`
+    // before any body chunk; a terminal before `head` is an error (or the
+    // "no head" case the prior buffering impl surfaced as a TypeError).
+    // The inner loop only `break`s for the retryable case — every other
+    // outcome returns the Response or throws.
+    for (;;) {
+      const { value: ev, done } = await iterator.next();
+      if (done) {
+        throw new TypeError('ipcFetch: stream ended without a head event');
+      }
+      if (ev.kind === 'event' && ev.name === 'head') {
+        const head = ev.data as { status: number; headers: Record<string, string> };
+        return new Response(makeBodyStream(iterator, abort), {
+          status: head.status,
+          headers: head.headers,
+        });
+      }
+      if (ev.kind === 'done') {
+        throw new TypeError('ipcFetch: stream ended without a head event');
+      }
+      if (ev.kind === 'error') {
+        if (ev.code === RETRYABLE_ERROR_CODE && attempt < maxRetries) {
+          break; // → backoff + re-dispatch on the reconnected socket
+        }
+        throw terminalError(ev.code, ev.message);
+      }
+      // A body chunk before `head` shouldn't happen — ignore and keep reading.
     }
-    if (ev.kind === 'event' && ev.name === 'head') {
-      const head = ev.data as { status: number; headers: Record<string, string> };
-      return new Response(makeBodyStream(iterator, abort), {
-        status: head.status,
-        headers: head.headers,
-      });
-    }
-    if (ev.kind === 'done') {
-      throw new TypeError('ipcFetch: stream ended without a head event');
-    }
-    if (ev.kind === 'error') {
-      throw terminalError(ev.code, ev.message);
-    }
-    // A body chunk before `head` shouldn't happen — ignore and keep reading.
+
+    // Reached only by the retryable `break`. Close the dead call's iterator,
+    // honor a caller abort instead of redispatching into the void, back off,
+    // then loop to re-dispatch (which drives the Rust reconnect).
+    void iterator.return?.(undefined);
+    if (callerSignal?.aborted) throw new DOMException('request aborted', 'AbortError');
+    await sleep(backoffMs[Math.min(attempt, backoffMs.length - 1)], callerSignal);
+    if (callerSignal?.aborted) throw new DOMException('request aborted', 'AbortError');
   }
 }
