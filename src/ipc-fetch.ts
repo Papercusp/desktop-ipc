@@ -254,6 +254,25 @@ export async function ipcFetch(
       }
       if (ev.kind === 'event' && ev.name === 'head') {
         const head = ev.data as { status: number; headers: Record<string, string> };
+        // Null-body statuses: `new Response(stream, { status: 204 })` THROWS
+        // ("Response cannot have a body with the given status") — in WebKit
+        // this made every IPC-routed DELETE→204 reject after the server had
+        // already acted (e.g. the dock Reset-layout silently doing nothing).
+        // Hand back a bodyless Response and drain the channel in the
+        // background so the call completes cleanly server-side.
+        if (head.status === 204 || head.status === 205 || head.status === 304) {
+          void (async () => {
+            try {
+              for (;;) {
+                const r = await iterator.next();
+                if (r.done) break;
+              }
+            } catch {
+              /* drain is best-effort */
+            }
+          })();
+          return new Response(null, { status: head.status, headers: head.headers });
+        }
         return new Response(makeBodyStream(iterator, abort), {
           status: head.status,
           headers: head.headers,

@@ -34,6 +34,19 @@ describe('ipcFetch', () => {
     expect(await res.text()).toBe('{"ok":true}');
   });
 
+  it('returns a NULL-body Response for 204/205/304 (a stream body throws in WebKit)', async () => {
+    for (const status of [204, 205, 304]) {
+      const dispatch = dispatcher([
+        { kind: 'event', name: 'head', data: { status, headers: { 'x-probe': 'y' } } },
+        { kind: 'done', result: { content: [] } },
+      ]);
+      const res = await ipcFetch('/api/thing', { method: 'DELETE' }, { dispatch });
+      expect(res.status).toBe(status);
+      expect(res.body).toBeNull();
+      expect(res.headers.get('x-probe')).toBe('y');
+    }
+  });
+
   it('forwards non-200 status without throwing', async () => {
     const dispatch = dispatcher([
       {
