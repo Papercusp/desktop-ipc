@@ -76,8 +76,6 @@ export interface IpcEventSourceOptions {
   reconnectMs?: number;
 }
 
-type ReadyState = 0 | 1 | 2;
-
 export class IpcEventSource extends EventTarget {
   static readonly CONNECTING = 0 as const;
   static readonly OPEN = 1 as const;
@@ -88,7 +86,13 @@ export class IpcEventSource extends EventTarget {
 
   readonly url: string;
   readonly withCredentials: boolean;
-  readyState: ReadyState = 0;
+  // `number` (not a `0 | 1 | 2` literal union) on purpose: this field is mutated
+  // across `await`s by close()/terminate(), and a literal union makes TS's
+  // control-flow analysis narrow it (e.g. the `while (readyState !== 2)` loop in
+  // run()) and then wrongly flag the legitimate post-await `=== 2` re-checks as
+  // "no overlap". `number` also matches the native EventSource.readyState contract
+  // this class faithfully emulates. Semantics unchanged: 0=CONNECTING,1=OPEN,2=CLOSED.
+  readyState: number = 0;
 
   onopen: ((this: IpcEventSource, ev: Event) => unknown) | null = null;
   onmessage: ((this: IpcEventSource, ev: MessageEvent) => unknown) | null = null;
