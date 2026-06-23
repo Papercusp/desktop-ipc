@@ -1,6 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { installDesktopIpcPolyfills, _resetForTests } from './desktop-bootstrap';
+import { installDesktopIpcPolyfills, isIpcUnavailable, _resetForTests } from './desktop-bootstrap';
 import { IpcEventSource } from './ipc-event-source';
+
+describe('isIpcUnavailable — IPC-down detection that gates the native-HTTP fallback', () => {
+  it('matches the in-process "state not managed" / "invoke_failed" signals', () => {
+    expect(isIpcUnavailable(new Error('endpoint_invoke: state not managed'))).toBe(true);
+    expect(isIpcUnavailable(new Error('invoke_failed: foo'))).toBe(true);
+  });
+  it('matches the WebKit "access control checks" rejection of the ipc:// invoke fetch (the desktop-load bug)', () => {
+    expect(
+      isIpcUnavailable(new Error('Fetch API cannot load ipc://localhost/endpoint_invoke due to access control checks')),
+    ).toBe(true);
+  });
+  it('does NOT match real upstream errors (those must surface, not fall back)', () => {
+    expect(isIpcUnavailable(new Error('upstream_error: 500'))).toBe(false);
+    expect(isIpcUnavailable(new Error('aborted'))).toBe(false);
+  });
+});
 
 /* Tests run in Node (no real window). We synthesize a minimal window
  * + tauri-internals shape so the install path executes. */

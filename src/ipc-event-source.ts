@@ -65,7 +65,15 @@ export function _resetIpcEventSourceFallback(): void {
  * import cycle: bootstrap imports this module).
  */
 function isIpcUnavailableMessage(msg: string): boolean {
-  return msg.includes('invoke_failed') || msg.includes('state not managed');
+  return (
+    msg.includes('invoke_failed') ||
+    msg.includes('state not managed') ||
+    // WebKitGTK / WKWebView reject the `ipc://localhost/<cmd>` invoke fetch at the WEBVIEW
+    // layer ("… access control checks") BEFORE it reaches Rust → same meaning as the above:
+    // IPC isn't usable → native-HTTP / EventSource fallback. (Mirror of isIpcUnavailable.)
+    msg.includes('access control') ||
+    msg.includes('ipc://')
+  );
 }
 
 export interface IpcEventSourceOptions {

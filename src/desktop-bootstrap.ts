@@ -72,9 +72,19 @@ function isSameOriginApiPath(url: string | URL): boolean {
  * comment says: fall back to HTTP. `upstream_error` / `aborted` / etc.
  * mean IPC *did* run, so those are real and must NOT be retried.
  */
-function isIpcUnavailable(err: unknown): boolean {
+export function isIpcUnavailable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes('invoke_failed') || msg.includes('state not managed');
+  return (
+    msg.includes('invoke_failed') ||
+    msg.includes('state not managed') ||
+    // WebKitGTK / WKWebView reject the `ipc://localhost/<cmd>` invoke fetch at the
+    // WEBVIEW layer ("Fetch API cannot load ipc://… due to access control checks")
+    // BEFORE it reaches Rust — so it never returns 'state not managed'. Same meaning:
+    // IPC isn't usable → fall back to HTTP (dev skips the sidecar spawn; the operator is
+    // reachable over HTTP). Any `ipc://` fetch failure ⇒ IPC-layer problem ⇒ fall back.
+    msg.includes('access control') ||
+    msg.includes('ipc://')
+  );
 }
 
 export function installDesktopIpcPolyfills(): InstallHandle | null {
