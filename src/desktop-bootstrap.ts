@@ -107,6 +107,26 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   // until a real consumer needs it.
   const patchedFetch: typeof window.fetch = (input, init) => {
     if (typeof input === 'string' || input instanceof URL) {
+      // ipc-cors-2026-06-24: Tauri's IPC init script tries the `ipc://localhost/<cmd>`
+      // custom-protocol fetch FIRST on non-Android. On Linux/WebKitGTK, when the frontend is
+      // served from a REMOTE origin (Papercusp loads the operator over http://127.0.0.1:<port>,
+      // not the bundled tauri:// asset protocol), wry registers custom schemes secure-only — never
+      // CORS-enabled — so WebKitGTK floods the console with "Fetch API cannot load
+      // ipc://localhost/<cmd> due to access control checks" on every invoke. Reject the ipc://
+      // fetch HERE, before the native fetch is ever issued, so the engine never evaluates (and
+      // never logs) it. Tauri's init script catches this and transparently retries the invoke over
+      // its postMessage transport — the path that already carries every IPC call on this platform
+      // (the custom-protocol path was never usable here). Net: identical behavior, zero console
+      // noise. The matching `IPC custom protocol failed …` warn is filtered below.
+      const urlStr = typeof input === 'string' ? input : input.toString();
+      if (urlStr.startsWith('ipc://')) {
+        return Promise.reject(
+          new DOMException(
+            'papercusp: ipc custom-protocol fetch disabled on remote-origin WebKitGTK — using postMessage',
+            'NotAllowedError',
+          ),
+        );
+      }
       if (isSameOriginApiPath(input)) {
         // Try IPC; if the IPC backend isn't available (dev mode has no
         // sidecar; prod has a startup window before the handshake),
@@ -124,6 +144,22 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   };
   window.fetch = patchedFetch;
 
+  // ipc-cors-2026-06-24: silence Tauri's own one-per-load warn that fires when our patchedFetch
+  // rejects the ipc:// custom-protocol attempt above (`console.warn('IPC custom protocol failed,
+  // Tauri will now use the postMessage interface instead', …)`). On this platform the postMessage
+  // fallback is the intended, working path — the warn is pure noise. Scoped to that exact message
+  // so every other warning passes through untouched. Guarded: `window.console` is always present
+  // in a webview but may be absent in non-DOM hosts (tests/SSR).
+  const consoleHost = (window as unknown as { console?: Console }).console;
+  const originalWarn = consoleHost?.warn?.bind(consoleHost);
+  const filteredWarn: ((...args: unknown[]) => void) | undefined = originalWarn
+    ? (...args: unknown[]) => {
+        if (typeof args[0] === 'string' && args[0].includes('IPC custom protocol failed')) return;
+        originalWarn(...args);
+      }
+    : undefined;
+  if (consoleHost && filteredWarn) consoleHost.warn = filteredWarn as typeof console.warn;
+
   // Patch EventSource. IpcEventSource implements the same interface; a
   // future cross-origin EventSource would surface `bad_path` from the
   // bridge — fix-forward when that consumer appears.
@@ -140,6 +176,9 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   return {
     uninstall: () => {
       window.fetch = originalFetchRef;
+      if (consoleHost && originalWarn && consoleHost.warn === filteredWarn) {
+        consoleHost.warn = originalWarn as typeof console.warn;
+      }
       (window as unknown as { EventSource: typeof window.EventSource }).EventSource =
         OriginalEventSource;
       setNativeEventSourceFallback(undefined);

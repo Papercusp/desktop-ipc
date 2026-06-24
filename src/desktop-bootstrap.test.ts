@@ -26,6 +26,7 @@ interface TestWindow {
   location?: { origin: string };
   fetch?: typeof fetch;
   EventSource?: typeof EventSource;
+  console?: Console;
 }
 
 let originalGlobalFetch: typeof fetch | undefined;
@@ -139,6 +140,40 @@ describe('installDesktopIpcPolyfills', () => {
     expect(fakeFetch).toHaveBeenCalledTimes(2); // unchanged
 
     handle!.uninstall();
+  });
+
+  it('rejects ipc:// custom-protocol fetches WITHOUT hitting native fetch (kills the WebKitGTK "access control checks" error)', async () => {
+    const win = (globalThis as { window?: TestWindow }).window!;
+    const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+    installDesktopIpcPolyfills();
+
+    // Tauri's IPC init script issues this exact fetch; on remote-origin WebKitGTK it would
+    // otherwise flood the console. We reject it (Tauri retries over postMessage) and NEVER
+    // call native fetch — so the engine never logs the access-control error.
+    let rejected = false;
+    try {
+      await win.fetch!('ipc://localhost/endpoint_invoke');
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+    expect(fakeFetch).not.toHaveBeenCalled(); // native fetch never issued for ipc://
+  });
+
+  it('filters Tauri\'s "IPC custom protocol failed" warn but passes every other warning through', () => {
+    const win = (globalThis as { window?: TestWindow }).window!;
+    const realWarn = vi.fn();
+    (win as unknown as { console: Console }).console = { warn: realWarn } as unknown as Console;
+
+    const handle = installDesktopIpcPolyfills();
+    win.console!.warn('IPC custom protocol failed, Tauri will now use the postMessage interface instead', {});
+    win.console!.warn('some other warning');
+    expect(realWarn).toHaveBeenCalledTimes(1);
+    expect(realWarn).toHaveBeenCalledWith('some other warning');
+
+    handle!.uninstall();
+    win.console!.warn('IPC custom protocol failed, …'); // restored → passes through now
+    expect(realWarn).toHaveBeenCalledTimes(2);
   });
 
   it('passes Request-form inputs straight to native fetch (Phase 1 limitation)', async () => {
