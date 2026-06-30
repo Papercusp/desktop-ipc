@@ -142,6 +142,34 @@ describe('installDesktopIpcPolyfills', () => {
     handle!.uninstall();
   });
 
+  it('routes same-origin /api/desktop/* via NATIVE fetch, NOT ipcFetch (content-origin endpoints must hit the operator serving THIS webview)', async () => {
+    const win = (globalThis as { window?: TestWindow }).window!;
+    const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+    const handle = installDesktopIpcPolyfills();
+
+    // /api/desktop/dev-operators describes the LOCAL operator — IPC-rerouting it
+    // to the (possibly different) IPC-owning operator makes it 404 + the env
+    // switcher bar silently self-hides. So it MUST go straight to native fetch.
+    const res = await win.fetch!('/api/desktop/dev-operators');
+    expect(await res.text()).toBe('native');
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+
+    // Sibling desktop endpoints (version / setup-wizard / voice-config) too.
+    await win.fetch!('/api/desktop/version');
+    expect(fakeFetch).toHaveBeenCalledTimes(2);
+
+    // Contrast: a NON-desktop /api/* still routes through ipcFetch — the heavy
+    // shared traffic keeps the libsoup SSE-starvation fix; native NOT called.
+    try {
+      await win.fetch!('/api/work-items');
+    } catch {
+      /* ipcFetch throws (no real Tauri to invoke through) */
+    }
+    expect(fakeFetch).toHaveBeenCalledTimes(2); // unchanged → went to ipcFetch
+
+    handle!.uninstall();
+  });
+
   it('rejects ipc:// custom-protocol fetches WITHOUT hitting native fetch (kills the WebKitGTK "access control checks" error)', async () => {
     const win = (globalThis as { window?: TestWindow }).window!;
     const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
