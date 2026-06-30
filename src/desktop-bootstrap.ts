@@ -48,7 +48,19 @@ function isSameOriginApiPath(url: string | URL): boolean {
   if (typeof window === 'undefined') return false;
   try {
     const u = new URL(typeof url === 'string' ? url : url.toString(), window.location.origin);
-    return u.origin === window.location.origin && u.pathname.startsWith('/api/');
+    if (u.origin !== window.location.origin) return false;
+    // `/api/desktop/*` describes the operator SERVING THIS webview (its version,
+    // env list, setup state, voice port, pipeline) — so it MUST hit the content
+    // origin, NOT the IPC-owning operator the reroute targets. On the dev box the
+    // IPC owner is often a DIFFERENT build (a sibling on another port) that may not
+    // even serve these endpoints → 404, which silently HIDES the env-switcher bar
+    // (it self-hides when /api/desktop/dev-operators returns no data). These are a
+    // few small one-shot/30s polls, so native HTTP is cheap; the IPC reroute (the
+    // libsoup SSE-socket-starvation fix) stays for the heavy shared /api traffic.
+    // Holds in public release too: there's no reroute there, so native = the only
+    // operator. See agent-insights/verifying-desktop-fixes-on-the-right-instance.
+    if (u.pathname.startsWith('/api/desktop/')) return false;
+    return u.pathname.startsWith('/api/');
   } catch {
     return false;
   }
