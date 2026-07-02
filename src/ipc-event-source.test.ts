@@ -222,6 +222,47 @@ describe('IpcEventSource', () => {
     expect(es.readyState).toBe(2);
   });
 
+  it('a drop MID-EVENT does not corrupt the reconnected stream (fresh parser per connection)', async () => {
+    // Regression: the SSE parser used to be shared across internal reconnects.
+    // A stream that dropped mid-event (e.g. an operator restart killing it
+    // half-way through a large `backfill`) left the unterminated partial line
+    // buffered, and the NEXT connection's first event got the stale bytes
+    // prepended — an unparseable backfill the server never re-sends, wedging
+    // the thinking pane on "connecting…" while small follow events still flow.
+    const d = dispatcherFromQueue();
+    const es = new IpcEventSource('/api/stream', { dispatch: d.dispatch, reconnectMs: 5 });
+    const backfills: string[] = [];
+    es.addEventListener('backfill', (ev) => backfills.push((ev as MessageEvent).data as string));
+
+    let opens = 0;
+    es.onopen = () => { opens++; };
+    d.push({
+      kind: 'event',
+      name: 'head',
+      data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    });
+    await waitFor(() => opens === 1);
+
+    // A PARTIAL event — the connection dies before the data line terminates.
+    d.push({ kind: 'event', name: 'sse-chunk', data: 'event: backfill\ndata: [{"par' });
+    d.push({ kind: 'done', result: { content: [] } });
+
+    // Reconnect: the server re-sends the WHOLE backfill on the new connection.
+    d.push({
+      kind: 'event',
+      name: 'head',
+      data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    });
+    await waitFor(() => opens === 2);
+    d.push({ kind: 'event', name: 'sse-chunk', data: 'event: backfill\ndata: ["ok"]\n\n' });
+
+    await waitFor(() => backfills.length === 1);
+    // Must be EXACTLY the re-sent payload — no stale partial-line prefix.
+    expect(backfills[0]).toBe('["ok"]');
+    expect(() => JSON.parse(backfills[0])).not.toThrow();
+    es.close();
+  });
+
   it('forwards Last-Event-ID on reconnect (resume semantics)', async () => {
     const d = dispatcherFromQueue();
     const es = new IpcEventSource('/api/stream', { dispatch: d.dispatch, reconnectMs: 5 });

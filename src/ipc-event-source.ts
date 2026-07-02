@@ -106,7 +106,6 @@ export class IpcEventSource extends EventTarget {
   onmessage: ((this: IpcEventSource, ev: MessageEvent) => unknown) | null = null;
   onerror: ((this: IpcEventSource, ev: Event) => unknown) | null = null;
 
-  private readonly parser = new SseParser();
   private readonly abort = new AbortController();
   private readonly dispatch: DispatchEndpointStreamFn;
   private lastEventId = '';
@@ -216,6 +215,14 @@ export class IpcEventSource extends EventTarget {
   private async runOnce(): Promise<'fatal' | 'drop'> {
     const headers: Record<string, string> = { accept: 'text/event-stream' };
     if (this.lastEventId) headers['Last-Event-ID'] = this.lastEventId;
+    // Parser state is PER-CONNECTION (native EventSource semantics): a stream
+    // that drops MID-EVENT leaves an unterminated partial line buffered, and a
+    // shared parser would prepend it to the reconnected stream's first event —
+    // corrupting it. That first event is often the one-shot `backfill` of a
+    // live-follow stream, which then fails to parse and can never be re-sent:
+    // the "connecting… forever while small events still flow" wedge.
+    // `this.lastEventId` intentionally persists across attempts (spec).
+    const parser = new SseParser();
 
     try {
       for await (const ev of this.dispatch(
@@ -246,7 +253,7 @@ export class IpcEventSource extends EventTarget {
           ev.name === 'sse-chunk' &&
           typeof ev.data === 'string'
         ) {
-          const parsed = this.parser.feed(ev.data);
+          const parsed = parser.feed(ev.data);
           for (const p of parsed) {
             if (p.lastEventId !== null) this.lastEventId = p.lastEventId;
             const msg = new MessageEvent(p.type, {
