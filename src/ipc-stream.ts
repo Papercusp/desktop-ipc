@@ -7,9 +7,19 @@
  * dispatchProjectedToolStream → ctx.emit() → frame → Rust reader →
  * Channel<EndpointEvent> → here.
  *
- * The Rust side ships binary events as base64 (Tauri's IPC serializer
- * is JSON-based). We decode back to Uint8Array on yield, so consumers
- * see a uniform `EndpointStreamEvent` shape across transports.
+ * The Rust side ships binary events as base64 and we decode back to
+ * Uint8Array on yield, so consumers see a uniform `EndpointStreamEvent`
+ * shape across transports.
+ *
+ * That base64 leg is a CHOICE WE STILL OWE A REVISIT, not a platform limit.
+ * The old note here ("Tauri's IPC serializer is JSON-based") described Tauri
+ * v1; v2 has `InvokeResponseBody::Raw`, and `Channel::send` accepts it, so a
+ * binary frame can cross without the encode/decode round-trip. Measured on a
+ * 6.65MB payload in V8: base64 encode+decode 14.2ms against 4.6ms for the
+ * memcpy you cannot avoid — real, and worth taking, but a separate change
+ * with its own Rust-side edit (out of scope for
+ * drop-sync-batcher-2026-07-25; see its D-002 for why chasing the remaining
+ * 4.6ms by leaving the webview entirely is NOT worth it).
  */
 
 import { Channel, invoke } from '@tauri-apps/api/core';
