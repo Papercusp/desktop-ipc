@@ -356,6 +356,9 @@ describe('IpcEventSource', () => {
       close(): void {}
     }
     setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
+    // Grace 0: exercise the post-grace "IPC is dead" path directly. With the
+    // default grace an invoke_failed is RETRIED rather than terminal (WI-6257).
+    configureDesktopIpc({ ipcStartupGraceMs: 0 });
     try {
       // 1st construction: injected dispatch yields the unwired-backend error
       // (ipc-stream emits {kind:'error', code:'invoke_failed'}), latching the
@@ -376,6 +379,7 @@ describe('IpcEventSource', () => {
       expect(created[0].url).toContain('/api/ui/intents/stream');
       expect(created[0].withCredentials).toBe(true);
     } finally {
+      configureDesktopIpc({ ipcStartupGraceMs: undefined });
       _resetIpcEventSourceFallback();
     }
   });
@@ -411,12 +415,20 @@ describe('IpcEventSource', () => {
 
     function setup(cooldownMs: number): void {
       FakeNativeEventSource.created = [];
-      configureDesktopIpc({ ipcStreamFallbackCooldownMs: cooldownMs });
+      // Grace 0 so an invoke_failed latches immediately — these tests are about
+      // the COOLDOWN, not the WI-6257 startup grace (covered separately below).
+      configureDesktopIpc({
+        ipcStreamFallbackCooldownMs: cooldownMs,
+        ipcStartupGraceMs: 0,
+      });
       setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
     }
 
     function teardown(): void {
-      configureDesktopIpc({ ipcStreamFallbackCooldownMs: undefined });
+      configureDesktopIpc({
+        ipcStreamFallbackCooldownMs: undefined,
+        ipcStartupGraceMs: undefined,
+      });
       _resetIpcEventSourceFallback();
     }
 
@@ -489,6 +501,86 @@ describe('IpcEventSource', () => {
         ok.close();
       } finally {
         teardown();
+      }
+    });
+  });
+
+  // WI-6257 — "the IPC bridge isn't up YET" is a STARTUP RACE, not a dead
+  // backend. Falling back to native HTTP costs a long-lived SSE one of
+  // libsoup's ~6 per-host sockets for the whole session, so inside the grace
+  // the stream must WAIT for IPC rather than buy data with a permanent socket.
+  describe('IPC startup grace (WI-6257)', () => {
+    function reset(): void {
+      configureDesktopIpc({ ipcStartupGraceMs: undefined, ipcStartupRetryMs: undefined });
+      _resetIpcEventSourceFallback();
+    }
+
+    it('retries instead of terminating when IPC is not up yet, then opens over IPC', async () => {
+      configureDesktopIpc({ ipcStartupGraceMs: 5_000, ipcStartupRetryMs: 5 });
+      try {
+        const d = dispatcherFromQueue();
+        const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
+
+        // The bridge isn't wired yet — exactly what a boot stream races.
+        d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+
+        // It must NOT go terminal: pre-WI-6257 this closed and handed the
+        // consumer a native EventSource that held a socket for the session.
+        await new Promise((r) => setTimeout(r, 40));
+        expect(es.readyState).toBe(0); // CONNECTING, still trying IPC
+
+        // Bridge comes up → the SAME source opens over IPC. No native fallback,
+        // no socket burned.
+        d.push({
+          kind: 'event',
+          name: 'head',
+          data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        });
+        await waitFor(() => es.readyState === 1);
+        es.close();
+      } finally {
+        reset();
+      }
+    });
+
+    it('does not fire error while waiting for the bridge (nothing dropped yet)', async () => {
+      configureDesktopIpc({ ipcStartupGraceMs: 5_000, ipcStartupRetryMs: 5 });
+      try {
+        const d = dispatcherFromQueue();
+        const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
+        let errors = 0;
+        es.onerror = () => {
+          errors += 1;
+        };
+
+        // Several failed attempts inside the grace.
+        for (let i = 0; i < 3; i += 1) {
+          d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+          await new Promise((r) => setTimeout(r, 15));
+        }
+
+        // A source that has never opened must stay quiet — a burst of spurious
+        // errors at boot is what pushes a resilient wrapper into recreating us.
+        expect(errors).toBe(0);
+        expect(es.readyState).toBe(0);
+        es.close();
+      } finally {
+        reset();
+      }
+    });
+
+    it('still latches + falls back once the grace has expired', async () => {
+      // Grace 0 = the pre-WI-6257 semantics, which must be preserved for a
+      // genuinely dead bridge (a stale advertisement, an unwired backend).
+      configureDesktopIpc({ ipcStartupGraceMs: 0 });
+      try {
+        const d = dispatcherFromQueue();
+        const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
+        d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+        await waitFor(() => es.readyState === 2);
+        expect(es.readyState).toBe(2);
+      } finally {
+        reset();
       }
     });
   });

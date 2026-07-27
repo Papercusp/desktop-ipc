@@ -27,7 +27,11 @@ import { dispatchEndpointStreamIpc } from './ipc-stream';
 import type { DispatchEndpointStreamFn } from './types';
 import { SseParser } from './sse-parser';
 import { emitIpcTrace, nextIpcTraceId } from './ipc-inspector';
-import { getIpcStreamFallbackCooldownMs } from './config';
+import {
+  getIpcStreamFallbackCooldownMs,
+  getIpcStartupGraceMs,
+  getIpcStartupRetryMs,
+} from './config';
 
 /**
  * Native EventSource ctor, captured by the desktop bootstrap *before* it does
@@ -158,6 +162,24 @@ export class IpcEventSource extends EventTarget {
   private readonly reconnectMs: number;
   /** Inspector correlation id — shared by every lifecycle event of THIS source. */
   private readonly traceId = nextIpcTraceId();
+  /** Construction time — the origin of the startup grace window (see inStartupGrace). */
+  private readonly createdAtMs = Date.now();
+
+  /**
+   * True while this source is young enough that "the IPC bridge isn't up yet"
+   * should be RETRIED rather than treated as a dead backend.
+   *
+   * The webview mounts and opens its streams before the Rust `IpcClientHandle`
+   * has connected, so without this every boot stream took the unavailable path
+   * and fell back to native HTTP — and because a long-lived SSE connection
+   * holds one of libsoup's ~6 per-host sockets for the whole session, those
+   * boot-era streams exhausted the pool for the rest of the page's life
+   * (WI-6257). Waiting a beat costs a stream that will live for hours almost
+   * nothing; falling back costs it a socket forever.
+   */
+  private inStartupGrace(): boolean {
+    return Date.now() - this.createdAtMs < getIpcStartupGraceMs();
+  }
 
   constructor(url: string | URL, init?: IpcEventSourceOptions) {
     super();
@@ -242,6 +264,17 @@ export class IpcEventSource extends EventTarget {
     while (this.readyState !== 2) {
       const outcome = await this.runOnce();
       if (outcome === 'fatal' || this.readyState === 2) return;
+      if (outcome === 'ipc-wait') {
+        // The IPC bridge isn't up YET (startup race), not dead. Stay CONNECTING
+        // and retry quickly — deliberately WITHOUT firing `error` or an es-drop
+        // trace, because nothing dropped: this source has never opened, and a
+        // burst of spurious errors during boot is exactly what would push a
+        // consumer's resilient wrapper into recreating us. Native EventSource
+        // is likewise silent while it has yet to connect.
+        this.readyState = 0;
+        await this.delay(getIpcStartupRetryMs());
+        continue;
+      }
       // Dropped → reconnect like native EventSource: go back to CONNECTING (NOT
       // closed), fire `error` (native fires it on disconnect), brief backoff,
       // re-open. A consumer that recreates only on CLOSED sees CONNECTING and
@@ -255,8 +288,14 @@ export class IpcEventSource extends EventTarget {
     }
   }
 
-  /** One connection attempt. 'fatal' → already `close()`d, stop. 'drop' → reconnect. */
-  private async runOnce(): Promise<'fatal' | 'drop'> {
+  /**
+   * One connection attempt.
+   * 'fatal'    → already `close()`d, stop.
+   * 'drop'     → a real disconnect; fire `error` + reconnect after the backoff.
+   * 'ipc-wait' → the IPC bridge isn't up yet and we're still inside the startup
+   *              grace; retry quietly and quickly, WITHOUT falling back to HTTP.
+   */
+  private async runOnce(): Promise<'fatal' | 'drop' | 'ipc-wait'> {
     const headers: Record<string, string> = { accept: 'text/event-stream' };
     if (this.lastEventId) headers['Last-Event-ID'] = this.lastEventId;
     // Parser state is PER-CONNECTION (native EventSource semantics): a stream
@@ -319,9 +358,13 @@ export class IpcEventSource extends EventTarget {
         } else if (ev.kind === 'error') {
           // The unwired/unready backend surfaces here (ipc-stream yields
           // {kind:'error', code:'invoke_failed'} rather than throwing). That is
-          // FATAL — latch so the next EventSource builds a native one (HTTP
-          // fallback). A non-IPC-unavailable error is a transient drop → reconnect.
+          // "Not up YET" inside the startup grace is retryable — wait for the
+          // bridge rather than burning a socket on native HTTP for the session.
+          // Only a backend still unavailable AFTER the grace is treated as dead:
+          // latch so the next EventSource builds a native one (HTTP fallback).
+          // A non-IPC-unavailable error is a transient drop → reconnect.
           if (isIpcUnavailableMessage(`${ev.code} ${ev.message}`)) {
+            if (this.inStartupGrace()) return 'ipc-wait';
             latchIpcUnavailable();
             this.terminate();
             return 'fatal';
@@ -335,7 +378,9 @@ export class IpcEventSource extends EventTarget {
       if (this.readyState === 2) return 'fatal';
       const msg = err instanceof Error ? err.message : String(err);
       if (isIpcUnavailableMessage(msg)) {
-        // Unavailable backend that threw rather than yielding an error → latch + terminal.
+        // Unavailable backend that THREW rather than yielding an error. Same
+        // startup-grace rule as the yielded-error path above.
+        if (this.inStartupGrace()) return 'ipc-wait';
         latchIpcUnavailable();
         this.terminate();
         return 'fatal';

@@ -39,7 +39,47 @@ export interface DesktopIpcConfig {
    * Default {@link DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS}.
    */
   ipcStreamFallbackCooldownMs?: number;
+
+  /**
+   * Startup grace (ms, from a stream's construction) during which "the IPC
+   * bridge isn't up YET" is treated as a RETRYABLE condition rather than a
+   * dead backend. Inside the window the stream stays CONNECTING and retries;
+   * only after it expires does the stream latch + fall back to native HTTP.
+   *
+   * This is what keeps boot streams OFF native HTTP. The fallback's benefit is
+   * transient (it only covers the window where the operator serves HTTP but the
+   * IPC bridge hasn't connected) while its cost is permanent: a long-lived SSE
+   * connection holds one of WebKitGTK/libsoup's ~6 per-host sockets for the
+   * whole session. Waiting a beat is the better trade for a stream that will
+   * live for hours; it is NOT the better trade for a one-shot fetch, which is
+   * why `ipcFetch` still falls back per call. Default
+   * {@link DEFAULT_IPC_STARTUP_GRACE_MS}.
+   */
+  ipcStartupGraceMs?: number;
+
+  /**
+   * Retry interval (ms) between IPC attempts INSIDE the startup grace. Shorter
+   * than the post-open reconnect backoff so several attempts fit in the window.
+   * Default {@link DEFAULT_IPC_STARTUP_RETRY_MS}.
+   */
+  ipcStartupRetryMs?: number;
 }
+
+/**
+ * Default startup grace before a stream gives up on IPC and falls back.
+ *
+ * ⚠ Deliberately conservative. A comment in `ipc-event-source.ts` long claimed a
+ * consumer open-watchdog ("DesktopAttentionNotifier") fires at ~4s, which would
+ * cap this — but that component does NOT exist anywhere in the tree (checked
+ * 2026-07-27), so the figure is UNVERIFIED and must not be treated as a
+ * measured constraint. Kept under it anyway, and made configurable, so a host
+ * that measures a real watchdog can tune rather than patch. If you confirm the
+ * true bound, record it here with the evidence.
+ */
+export const DEFAULT_IPC_STARTUP_GRACE_MS = 3_000;
+
+/** Default retry interval inside the startup grace. */
+export const DEFAULT_IPC_STARTUP_RETRY_MS = 400;
 
 /** Default cooldown before a latched IPC streaming backend is re-probed. */
 export const DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS = 5_000;
@@ -61,6 +101,22 @@ export function getIpcStreamFallbackCooldownMs(): number {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0
     ? v
     : DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS;
+}
+
+/** Resolve the startup grace during which IPC-unavailable is retryable, not fatal. */
+export function getIpcStartupGraceMs(): number {
+  const v = cfg.ipcStartupGraceMs;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0
+    ? v
+    : DEFAULT_IPC_STARTUP_GRACE_MS;
+}
+
+/** Resolve the retry interval used inside the startup grace. */
+export function getIpcStartupRetryMs(): number {
+  const v = cfg.ipcStartupRetryMs;
+  return typeof v === 'number' && Number.isFinite(v) && v > 0
+    ? v
+    : DEFAULT_IPC_STARTUP_RETRY_MS;
 }
 
 /** Resolve the force-HTTP escape hatch: host config first, generic env fallback otherwise. */
