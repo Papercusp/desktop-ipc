@@ -23,13 +23,44 @@ export interface DesktopIpcConfig {
    * host bundler still works).
    */
   forceHttp?: boolean | (() => boolean);
+
+  /**
+   * How long (ms) IPC streaming stays latched as "unavailable" — routing new
+   * EventSources straight to the native ctor — after an invoke proves the
+   * backend isn't answering. When the window expires the next construction
+   * re-probes IPC once; a fresh failure re-latches for another window, and a
+   * successful connect clears it immediately.
+   *
+   * This is a COOLDOWN rather than a permanent session flag on purpose: every
+   * condition that sets it is transient (the prod pre-handshake startup window,
+   * a momentarily stale dev socket advertisement), so a one-way latch stranded
+   * every SSE consumer on native HTTP for the life of the webview (WI-6255).
+   * Lower = faster recovery, more doomed invokes while genuinely down.
+   * Default {@link DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS}.
+   */
+  ipcStreamFallbackCooldownMs?: number;
 }
+
+/** Default cooldown before a latched IPC streaming backend is re-probed. */
+export const DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS = 5_000;
 
 let cfg: DesktopIpcConfig = {};
 
 /** Install host configuration. Merges over any previous call. */
 export function configureDesktopIpc(config: DesktopIpcConfig): void {
   cfg = { ...cfg, ...config };
+}
+
+/**
+ * Resolve the IPC-stream fallback cooldown. Host config first; a non-finite or
+ * negative value falls back to the default rather than disabling the re-probe.
+ * `0` is honored (re-probe on every construction) — useful in tests.
+ */
+export function getIpcStreamFallbackCooldownMs(): number {
+  const v = cfg.ipcStreamFallbackCooldownMs;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0
+    ? v
+    : DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS;
 }
 
 /** Resolve the force-HTTP escape hatch: host config first, generic env fallback otherwise. */

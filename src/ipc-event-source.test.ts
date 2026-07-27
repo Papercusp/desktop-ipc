@@ -4,6 +4,7 @@ import {
   setNativeEventSourceFallback,
   _resetIpcEventSourceFallback,
 } from './ipc-event-source';
+import { configureDesktopIpc } from './config';
 import { setIpcInspector, type IpcTraceEvent } from './ipc-inspector';
 import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
@@ -377,5 +378,118 @@ describe('IpcEventSource', () => {
     } finally {
       _resetIpcEventSourceFallback();
     }
+  });
+
+  // WI-6255 — the fallback is a COOLDOWN, not a permanent session verdict.
+  // Every condition that latches it is transient (prod's pre-handshake startup
+  // window, a momentarily stale dev socket advertisement), so a one-way latch
+  // stranded every SSE consumer on native HTTP for the life of the webview:
+  // ~10 streams against WebKitGTK/libsoup's ~6-connection per-host pool leaves
+  // the surplus CONNECTING forever. These pin the recovery semantics.
+  describe('IPC-unavailable cooldown (WI-6255)', () => {
+    class FakeNativeEventSource {
+      static created: string[] = [];
+      url: string;
+      constructor(url: string | URL) {
+        this.url = String(url);
+        FakeNativeEventSource.created.push(this.url);
+      }
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      close(): void {}
+    }
+
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    /** Drive one IpcEventSource to the IPC-unavailable latch. */
+    async function latchViaFailedInvoke(): Promise<void> {
+      const d = dispatcherFromQueue();
+      const es = new IpcEventSource('/api/ui/intents/stream', { dispatch: d.dispatch });
+      d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+      await waitFor(() => es.readyState === 2);
+    }
+
+    function setup(cooldownMs: number): void {
+      FakeNativeEventSource.created = [];
+      configureDesktopIpc({ ipcStreamFallbackCooldownMs: cooldownMs });
+      setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
+    }
+
+    function teardown(): void {
+      configureDesktopIpc({ ipcStreamFallbackCooldownMs: undefined });
+      _resetIpcEventSourceFallback();
+    }
+
+    it('re-probes IPC once the cooldown expires instead of latching forever', async () => {
+      setup(30);
+      try {
+        await latchViaFailedInvoke();
+
+        // Inside the cooldown: straight to native, no doomed invoke.
+        const during = new IpcEventSource('/api/sync/stream');
+        expect(during).toBeInstanceOf(FakeNativeEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(1);
+
+        await sleep(50);
+
+        // Cooldown expired → the next construction attempts IPC again. THIS is
+        // the property the old boolean latch made impossible: with it, a single
+        // boot-window failure pinned every later stream to native HTTP.
+        const after = new IpcEventSource('/api/sync/stream');
+        expect(after).toBeInstanceOf(IpcEventSource);
+        expect(after).not.toBeInstanceOf(FakeNativeEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(1);
+        (after as IpcEventSource).close();
+      } finally {
+        teardown();
+      }
+    });
+
+    it('re-latches when the re-probe also fails, so a dead backend costs one invoke per window', async () => {
+      setup(30);
+      try {
+        await latchViaFailedInvoke();
+        await sleep(50);
+
+        // Re-probe fails too → cooldown renewed rather than cleared.
+        await latchViaFailedInvoke();
+
+        const during = new IpcEventSource('/api/sync/stream');
+        expect(during).toBeInstanceOf(FakeNativeEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(1);
+      } finally {
+        teardown();
+      }
+    });
+
+    it('clears the cooldown immediately when an IPC stream connects', async () => {
+      // Long cooldown: only an explicit clear-on-connect can end it in time.
+      setup(60_000);
+      try {
+        await latchViaFailedInvoke();
+        expect(new IpcEventSource('/api/sync/stream')).toBeInstanceOf(FakeNativeEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(1);
+
+        // A stream that reaches a good head proves IPC works again.
+        const d = dispatcherFromQueue();
+        const ok = new IpcEventSource('/api/logs/stream', { dispatch: d.dispatch });
+        d.push({
+          kind: 'event',
+          name: 'head',
+          data: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        });
+        await waitFor(() => ok.readyState === 1);
+
+        // Peers stop being routed to native HTTP at once — they must not wait
+        // out the remaining 60s of the window.
+        const after = new IpcEventSource('/api/sync/stream');
+        expect(after).toBeInstanceOf(IpcEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(1);
+        (after as IpcEventSource).close();
+        ok.close();
+      } finally {
+        teardown();
+      }
+    });
   });
 });

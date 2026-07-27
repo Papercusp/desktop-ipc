@@ -27,6 +27,7 @@ import { dispatchEndpointStreamIpc } from './ipc-stream';
 import type { DispatchEndpointStreamFn } from './types';
 import { SseParser } from './sse-parser';
 import { emitIpcTrace, nextIpcTraceId } from './ipc-inspector';
+import { getIpcStreamFallbackCooldownMs } from './config';
 
 /**
  * Native EventSource ctor, captured by the desktop bootstrap *before* it does
@@ -42,21 +43,60 @@ import { emitIpcTrace, nextIpcTraceId } from './ipc-inspector';
 let nativeEventSourceCtor: typeof EventSource | undefined;
 
 /**
- * Latches once IPC streaming proves unavailable this session, so subsequent
- * EventSources go straight to the native ctor instead of failing and
- * reconnect-looping on the same dead invoke. Reset only via
- * `_resetIpcEventSourceFallback` (tests).
+ * Deadline (epoch ms) until which IPC streaming is treated as unavailable, so
+ * new EventSources go straight to the native ctor instead of failing and
+ * reconnect-looping on the same dead invoke. `0` = not latched.
+ *
+ * ⚠ A COOLDOWN, deliberately NOT a permanent session flag. This was
+ * `let ipcStreamingUnavailable = false` — a one-way module-global that no
+ * production path ever cleared (WI-6255). Both conditions that set it are
+ * TRANSIENT (see `isIpcUnavailable` in desktop-bootstrap): the prod window
+ * between webview mount and the sidecar's `PAPERCUSP_IPC_READY` handshake (up
+ * to 30s), and a momentarily missing/stale `endpoint-ipc.<port>.json`
+ * advertisement in dev, where the `IpcClientHandle` is *reconnecting*. So the
+ * permanent form fired on essentially every cold boot: the first stream to race
+ * the handshake pinned EVERY later stream to native HTTP for the life of the
+ * webview, and ~10 SSE consumers against WebKitGTK/libsoup's ~6-connection
+ * per-host pool left the surplus streams CONNECTING forever.
+ *
+ * `ipcFetch` never had this bug — its fallback is decided per call, so fetch
+ * self-healed the moment IPC came up while streams stayed starved. That
+ * split-brain (fetch on IPC, SSE on exhausted HTTP) is what made the symptom
+ * read as a sync concurrency cap rather than a transport fault.
  */
-let ipcStreamingUnavailable = false;
+let ipcUnavailableUntilMs = 0;
 
 export function setNativeEventSourceFallback(ctor: typeof EventSource | undefined): void {
   nativeEventSourceCtor = ctor;
 }
 
+/** True while the cooldown from a proven-unavailable IPC backend is still running. */
+function ipcStreamingLatched(): boolean {
+  return ipcUnavailableUntilMs > 0 && Date.now() < ipcUnavailableUntilMs;
+}
+
+/**
+ * Latch (or re-latch) the native-EventSource fallback for one cooldown window.
+ * Re-latching on a failed re-probe is what keeps a genuinely IPC-less webview
+ * from paying a doomed invoke per `createResilientEventSource` rebuild.
+ */
+function latchIpcUnavailable(): void {
+  ipcUnavailableUntilMs = Date.now() + getIpcStreamFallbackCooldownMs();
+}
+
+/**
+ * Clear the latch the moment IPC streaming demonstrably works, so the remaining
+ * consumers stop being routed to native HTTP without waiting out the rest of
+ * the cooldown. Called on every successful stream head.
+ */
+function clearIpcUnavailable(): void {
+  ipcUnavailableUntilMs = 0;
+}
+
 /** Test-only reset of the module-level fallback latch + native ctor. */
 export function _resetIpcEventSourceFallback(): void {
   nativeEventSourceCtor = undefined;
-  ipcStreamingUnavailable = false;
+  ipcUnavailableUntilMs = 0;
 }
 
 /**
@@ -125,13 +165,17 @@ export class IpcEventSource extends EventTarget {
     this.withCredentials = init?.withCredentials ?? false;
     this.dispatch = init?.dispatch ?? (dispatchEndpointStreamIpc as DispatchEndpointStreamFn);
     this.reconnectMs = init?.reconnectMs ?? 2000;
-    // IPC streaming already proved dead this session → don't reattempt the
-    // doomed invoke; hand back a real native EventSource instead. A
+    // IPC streaming proved dead RECENTLY (inside the cooldown) → don't reattempt
+    // the doomed invoke; hand back a real native EventSource instead. A
     // constructor that returns an object makes `new IpcEventSource()` yield
     // that object (spec-compliant), so consumers get native SSE with zero
     // event-proxying. Skipped when a dispatch fn is injected (tests / explicit
     // IPC use) so those paths keep exercising the IPC code.
-    if (ipcStreamingUnavailable && nativeEventSourceCtor && !init?.dispatch) {
+    //
+    // Once the cooldown expires this falls through and re-probes IPC, which is
+    // what lets a boot-window failure heal instead of stranding every stream on
+    // native HTTP for the life of the webview (WI-6255).
+    if (ipcStreamingLatched() && nativeEventSourceCtor && !init?.dispatch) {
       return new nativeEventSourceCtor(this.url, {
         withCredentials: this.withCredentials,
       }) as unknown as IpcEventSource;
@@ -237,6 +281,10 @@ export class IpcEventSource extends EventTarget {
           const ct = String(head.headers?.['content-type'] ?? '').toLowerCase();
           if (head.status === 200 && ct.includes('text/event-stream')) {
             this.readyState = 1;
+            // IPC streaming just demonstrably worked — drop any outstanding
+            // cooldown so peer consumers stop being routed to native HTTP
+            // immediately, rather than after the rest of the window (WI-6255).
+            clearIpcUnavailable();
             emitIpcTrace({ kind: 'es-connect', id: this.traceId, path: this.url });
             const open = new Event('open');
             this.dispatchEvent(open);
@@ -274,7 +322,7 @@ export class IpcEventSource extends EventTarget {
           // FATAL — latch so the next EventSource builds a native one (HTTP
           // fallback). A non-IPC-unavailable error is a transient drop → reconnect.
           if (isIpcUnavailableMessage(`${ev.code} ${ev.message}`)) {
-            ipcStreamingUnavailable = true;
+            latchIpcUnavailable();
             this.terminate();
             return 'fatal';
           }
@@ -288,7 +336,7 @@ export class IpcEventSource extends EventTarget {
       const msg = err instanceof Error ? err.message : String(err);
       if (isIpcUnavailableMessage(msg)) {
         // Unavailable backend that threw rather than yielding an error → latch + terminal.
-        ipcStreamingUnavailable = true;
+        latchIpcUnavailable();
         this.terminate();
         return 'fatal';
       }
