@@ -71,11 +71,21 @@ function isSameOriginApiPath(url: string | URL): boolean {
  * answer — as opposed to a genuine HTTP-level failure from the operator.
  *
  * `invoke_failed` is the code `ipc-stream.ts` emits when the Tauri
- * command itself couldn't run. The two ways that happens:
- *  - **dev mode** — `tauri dev` skips the sidecar spawn (the operator is
- *    served externally on :3055), so `endpoint_invoke`'s `IpcClient`
- *    state is never `.manage()`'d — the command errors with
- *    "state not managed".
+ * command itself couldn't run. The ways that happens:
+ *  - **dev mode, operator down or not yet advertising** — `tauri dev` skips
+ *    the SIDECAR spawn, but it does NOT leave dev without IPC: main.rs
+ *    (`#[cfg(debug_assertions)]`) still `.manage()`s a *reconnecting*
+ *    `IpcClientHandle` whose socket source re-reads
+ *    `~/.papercusp/endpoint-ipc.<selected-port>.json` on every (re)connect,
+ *    precisely so dev `/api` fetch + EventSource ride IPC and escape
+ *    libsoup's 6-socket pool. So in dev this branch means the ADVERTISEMENT
+ *    is missing/stale (no file for the selected port, dead pid, or vanished
+ *    socket) — not "dev has no IPC". Check that file before concluding the
+ *    transport is unavailable.
+ *    ⚠ Do NOT restore the older claim that dev "never `.manage()`s an
+ *    IpcClient / errors with 'state not managed'" — that predates the
+ *    reconnecting dev handle and sent at least one investigation (2026-07-26)
+ *    down the wrong path.
  *  - **prod startup window** — between webview mount and the sidecar's
  *    `PAPERCUSP_IPC_READY` handshake (up to 30s), the client isn't
  *    connected yet.
