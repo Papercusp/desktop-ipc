@@ -33,7 +33,7 @@ import {
   isRequireIpc,
   resolveIpcOwnerIsContentOrigin,
 } from './config';
-import { installEgressMonitor } from './egress-monitor';
+import { installEgressMonitor, _resetEgressMonitorForTests } from './egress-monitor';
 import { isIpcNotWired, isIpcUnavailable } from './ipc-availability';
 import { IpcEventSource, setNativeEventSourceFallback, _resetIpcEventSourceFallback } from './ipc-event-source';
 import { ipcFetch } from './ipc-fetch';
@@ -352,10 +352,22 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   };
 }
 
-/** Internal — tests reset module state. */
+/**
+ * Internal — tests reset module state.
+ *
+ * The egress monitor MUST be reset here too. `installEgressMonitor` is idempotent
+ * via a module-level `active` handle, and `PerformanceObserver` is a real global in
+ * Node — so without this line the first test to run captures the monitor and every
+ * later test's freshly-built `window` never receives `__papercusp_egress__`, since
+ * the installer returns the stale handle before it can attach. That reads as "the
+ * detector does not install", which is indistinguishable from the wiring bug these
+ * tests exist to catch. A reset that clears only part of a module's state is a trap
+ * for whoever writes the next test.
+ */
 export function _resetForTests(): void {
   installed = false;
   reportedExemptions.clear();
   _resetContentOriginCacheForTests();
   _resetIpcEventSourceFallback();
+  _resetEgressMonitorForTests();
 }

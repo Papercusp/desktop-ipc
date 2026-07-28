@@ -402,7 +402,8 @@ describe('egress detector installs regardless of transport branch', () => {
   afterEach(() => {
     deliver = null;
     (globalThis as { PerformanceObserver?: unknown }).PerformanceObserver = originalPO;
-    delete (globalThis as { window?: Record<string, unknown> }).window?.__papercusp_egress__;
+    delete (globalThis as unknown as { window?: Record<string, unknown> }).window
+      ?.__papercusp_egress__;
   });
 
   const egressHandle = () =>
