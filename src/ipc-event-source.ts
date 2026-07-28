@@ -33,6 +33,7 @@ import {
   getIpcStartupRetryMs,
   isRequireIpc,
 } from './config';
+import { isIpcNotWired, isIpcUnavailable } from './ipc-availability';
 
 /**
  * Native EventSource ctor, captured by the desktop bootstrap *before* it does
@@ -104,21 +105,13 @@ export function _resetIpcEventSourceFallback(): void {
   ipcUnavailableUntilMs = 0;
 }
 
-/**
- * Tauri "command/state not registered" — the IPC backend isn't wired/ready.
- * Mirrors `isIpcUnavailable` in desktop-bootstrap (kept local to avoid an
- * import cycle: bootstrap imports this module).
- */
+// Availability classification lives in its own leaf module (`ipc-availability`)
+// so this file and `desktop-bootstrap` share ONE implementation. It used to be
+// duplicated here "to avoid an import cycle" — the leaf module removes the cycle
+// without the copy, and a copy is exactly what would drift once `requireIpc`
+// made the two conditions behave differently.
 function isIpcUnavailableMessage(msg: string): boolean {
-  return (
-    msg.includes('invoke_failed') ||
-    msg.includes('state not managed') ||
-    // WebKitGTK / WKWebView reject the `ipc://localhost/<cmd>` invoke fetch at the WEBVIEW
-    // layer ("… access control checks") BEFORE it reaches Rust → same meaning as the above:
-    // IPC isn't usable → native-HTTP / EventSource fallback. (Mirror of isIpcUnavailable.)
-    msg.includes('access control') ||
-    msg.includes('ipc://')
-  );
+  return isIpcUnavailable(msg);
 }
 
 export interface IpcEventSourceOptions {
@@ -406,7 +399,14 @@ export class IpcEventSource extends EventTarget {
             // requireIpc: never burn a socket on native HTTP. Stay retryable
             // forever and say so LOUDLY — a silent revert to HTTP is what hid
             // this defect for two months (WI-6512).
-            if (isRequireIpc()) {
+            //
+            // EXCEPT when the bridge is NOT WIRED (`PAPERCUSP_DESKTOP_IPC=0`,
+            // a build without IPC, a webview refusing ipc://): nothing will
+            // create it later, so waiting is a permanent hang rather than a
+            // wait. That env var is a deliberate rollback lever — treat it like
+            // `forceHttp` and fall back, or pulling it would break the app at
+            // the exact moment someone reached for it.
+            if (isRequireIpc() && !isIpcNotWired(`${ev.code} ${ev.message}`)) {
               this.warnIpcUnavailableOnce(`${ev.code} ${ev.message}`);
               return 'ipc-wait';
             }
@@ -424,9 +424,9 @@ export class IpcEventSource extends EventTarget {
       const msg = err instanceof Error ? err.message : String(err);
       if (isIpcUnavailableMessage(msg)) {
         // Unavailable backend that THREW rather than yielding an error. Same
-        // startup-grace rule as the yielded-error path above.
+        // startup-grace and not-wired rules as the yielded-error path above.
         if (this.inStartupGrace()) return 'ipc-wait';
-        if (isRequireIpc()) {
+        if (isRequireIpc() && !isIpcNotWired(msg)) {
           this.warnIpcUnavailableOnce(msg);
           return 'ipc-wait';
         }
