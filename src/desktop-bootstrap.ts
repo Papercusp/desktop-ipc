@@ -339,7 +339,6 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
 
   return {
     uninstall: () => {
-      egress?.stop();
       window.fetch = originalFetchRef;
       if (consoleHost && originalWarn && consoleHost.warn === filteredWarn) {
         consoleHost.warn = originalWarn as typeof console.warn;
@@ -347,6 +346,13 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
       (window as unknown as { EventSource: typeof window.EventSource }).EventSource =
         OriginalEventSource;
       setNativeEventSourceFallback(undefined);
+      // LAST, and that ordering is load-bearing. The egress monitor wraps
+      // `EventSource` BEFORE this function captured `OriginalEventSource`, so
+      // `OriginalEventSource` IS the monitor's wrapper — the two patches are
+      // nested, and nested patches must unwind in LIFO order. Stopping the
+      // monitor first left its wrapper reinstated by the line above and the
+      // true native ctor stranded behind a detached recorder.
+      egress?.stop();
       installed = false;
     },
   };
