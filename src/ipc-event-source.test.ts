@@ -677,13 +677,20 @@ describe('IpcEventSource', () => {
       }
     });
 
-    // Pins the TEMPORARY hold + the exact reason, so nobody flips it back on
-    // without doing the thing that makes it safe. Measured 2026-07-28: with
-    // requireIpc ON and the bridge not dialing, a probed EventSource stayed
-    // readyState 0 for 12s straight — a hang, not a speedup.
-    it('defaults OFF for now because the Rust IPC dial does not reconnect (WI-6512)', () => {
-      expect(DEFAULT_REQUIRE_IPC).toBe(false);
-      expect(isRequireIpc()).toBe(false);
+    // Pins the default ON, and the reason, so a future "let's re-add a safety
+    // fallback" has to argue with the measurement rather than the intuition.
+    //
+    // This assertion was `false` until 2026-07-28, held there because the Rust
+    // dial was broken (WI-6512: `discovery_pid_alive` grepped the cmdline for
+    // serve.mjs/serve.ts while every live operator runs as hono-host, so every
+    // advertisement read as a restart orphan). With the dial fixed and verified
+    // live — six concurrent EventSources all at readyState 1, WebKit network
+    // process holding 2 TCP connections before/during/after, i.e. the streams
+    // consumed no sockets — the fallback is pure downside: it cannot make the
+    // app work, it can only make a broken transport look like a slow one.
+    it('defaults ON — the silent HTTP fallback is a silence, not a safety net (WI-6512)', () => {
+      expect(DEFAULT_REQUIRE_IPC).toBe(true);
+      expect(isRequireIpc()).toBe(true);
     });
 
     it('forceHttp still overrides it, so the rollback lever keeps working', () => {
