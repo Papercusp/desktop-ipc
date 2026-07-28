@@ -53,6 +53,21 @@ export { configureDesktopIpc, type DesktopIpcConfig } from './config';
 // `window.EventSource`; also exported for direct use + cross-layer tests.
 export { IpcEventSource, type IpcEventSourceOptions } from './ipc-event-source';
 export { ipcFetch, type IpcFetchOptions } from './ipc-fetch';
+// P-003(a): the webview-HTTP-egress invariant. `classifyEgress` is the pure rule
+// (assert it anywhere); `getEgressReport` reads the live shell — null means
+// UNKNOWN (no monitor), never "clean".
+export {
+  installEgressMonitor,
+  getEgressReport,
+  classifyEgress,
+  EGRESS_RING_SIZE,
+  _resetEgressMonitorForTests,
+  type EgressEntry,
+  type EgressReport,
+  type EgressOptions,
+  type EgressMonitorHandle,
+  type ResourceTimingLike,
+} from './egress-monitor';
 export type {
   EndpointStreamEvent,
   DispatchEndpointStreamOptions,
