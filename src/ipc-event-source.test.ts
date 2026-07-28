@@ -693,6 +693,57 @@ describe('IpcEventSource', () => {
       expect(isRequireIpc()).toBe(true);
     });
 
+    // The hazard `requireIpc` introduces, and why not-wired must be exempt.
+    //
+    // `PAPERCUSP_DESKTOP_IPC=0` is the Rust-side rollback lever: it skips
+    // `.manage()` for the IPC handle entirely, so every invoke returns "state
+    // not managed" forever. Under a single collapsed unavailable-predicate,
+    // requireIpc would answer that with 'ipc-wait' — i.e. pulling the rollback
+    // lever would hang every stream for the life of the process, breaking the
+    // app at exactly the moment someone reached for the lever to un-break it.
+    // A not-wired bridge means the operator chose HTTP; honour it.
+    it('falls back (not hangs) when the bridge is NOT WIRED, even under requireIpc', async () => {
+      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5, requireIpc: true });
+      try {
+        const d = dispatcherFromQueue();
+        const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
+        // Exactly what a PAPERCUSP_DESKTOP_IPC=0 shell returns: the Rust side
+        // registers a DISABLED handle that says so, rather than leaving the
+        // state unmanaged (which is indistinguishable from "still booting").
+        d.push({
+          kind: 'error',
+          code: 'ipc_disabled',
+          message: 'ipc_disabled: endpoint-ipc is off (PAPERCUSP_DESKTOP_IPC=0)',
+        });
+        // CLOSED, not stuck CONNECTING: terminal, so the consumer's resilient
+        // wrapper rebuilds and gets a native EventSource on the latch.
+        await waitFor(() => es.readyState === 2);
+        expect(es.readyState).toBe(2);
+      } finally {
+        reset();
+      }
+    });
+
+    it('still WAITS (does not fall back) when the bridge is merely not ready yet', async () => {
+      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5, requireIpc: true });
+      try {
+        const d = dispatcherFromQueue();
+        const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
+        // The operator is booting: the handle IS managed, it just has no socket.
+        d.push({
+          kind: 'error',
+          code: 'invoke_failed',
+          message: 'invoke_failed: no endpoint-ipc socket available — no advertisement published',
+        });
+        // Give the retry loop room to run; it must stay CONNECTING, never CLOSED.
+        await new Promise((r) => setTimeout(r, 50));
+        expect(es.readyState).toBe(0);
+        es.close();
+      } finally {
+        reset();
+      }
+    });
+
     it('forceHttp still overrides it, so the rollback lever keeps working', () => {
       configureDesktopIpc({ requireIpc: true, forceHttp: true });
       try {

@@ -95,7 +95,7 @@ function isSameOriginApiPath(url: string | URL): boolean {
  * comment says: fall back to HTTP. `upstream_error` / `aborted` / etc.
  * mean IPC *did* run, so those are real and must NOT be retried.
  */
-export { isIpcUnavailable } from './ipc-availability';
+export { isIpcUnavailable, isIpcNotWired, isIpcNotReady } from './ipc-availability';
 
 export function installDesktopIpcPolyfills(): InstallHandle | null {
   if (typeof window === 'undefined') return null;

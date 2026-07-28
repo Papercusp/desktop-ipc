@@ -7,18 +7,18 @@
  * them became a hazard: waiting is right for a bridge that is *coming up*, and
  * catastrophic for a bridge that is *never coming up*.
  *
- *  - **not-ready** (`invoke_failed:…`): the Rust `IpcClientHandle` IS managed and
- *    answered — it just has no live socket to dial *right now* (the operator is
- *    still booting, or its advertisement is momentarily stale mid-restart). This
- *    is transient by construction: the handle re-resolves and re-dials on every
- *    call, so waiting genuinely resolves it.
+ *  - **not-ready** (`invoke_failed:…`, `state not managed`): the bridge is coming
+ *    up. Either the Rust `IpcClientHandle` answered but has no live socket to
+ *    dial *right now* (the operator is still booting, or its advertisement is
+ *    momentarily stale mid-restart), or the handle is not `.manage()`d YET —
+ *    in prod it is registered only after the operator is reachable, so
+ *    "state not managed" is a startup window, NOT a permanent condition.
+ *    Waiting genuinely resolves both.
  *
- *  - **not-wired** (`state not managed`, `access control`, `ipc://`): there is no
- *    bridge in this webview at all, and nothing will create one for the life of
- *    the process. Either the shell was launched with the Rust kill switch
- *    `PAPERCUSP_DESKTOP_IPC=0` (which skips `.manage()` entirely), this build has
- *    no IPC wired, or the webview itself rejects `ipc://` invokes at the fetch
- *    layer before they ever reach Rust.
+ *  - **not-wired** (`ipc_disabled`, `access control`, `ipc://`): there is no
+ *    bridge in this webview and nothing will create one. Either the shell was
+ *    launched with the Rust kill switch `PAPERCUSP_DESKTOP_IPC=0`, or the webview
+ *    itself rejects `ipc://` invokes at the fetch layer before they reach Rust.
  *
  * Why this matters concretely: `PAPERCUSP_DESKTOP_IPC=0` is a deliberate operator
  * rollback lever. Under a single collapsed predicate + `requireIpc`, pulling that
@@ -26,6 +26,13 @@
  * rollback lever would break the app at exactly the moment someone reached for it
  * to un-break it. A not-wired bridge is treated as equivalent to `forceHttp`:
  * the operator has chosen HTTP, so use HTTP.
+ *
+ * ⚠ The disabled case is signalled EXPLICITLY (the Rust side registers a handle
+ * that answers `ipc_disabled: …`) rather than inferred from `state not managed`.
+ * Inferring it is wrong and was tried first: `state not managed` is ALSO the
+ * prod pre-handshake window, so treating it as permanent silently reintroduces
+ * WI-6257 — every boot-era stream falls back and holds one of the webview's ~6
+ * sockets for the whole session. Intent must be stated, not guessed.
  */
 
 /**
@@ -35,11 +42,12 @@
 export function isIpcNotWired(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return (
-    msg.includes('state not managed') ||
+    // Explicit: the Rust side registered a DISABLED handle because the shell was
+    // launched with PAPERCUSP_DESKTOP_IPC=0.
+    msg.includes('ipc_disabled') ||
     // WebKitGTK / WKWebView reject the `ipc://localhost/<cmd>` invoke fetch at the
     // WEBVIEW layer ("Fetch API cannot load ipc://… due to access control checks")
-    // BEFORE it reaches Rust — so it never returns 'state not managed'. Same
-    // meaning: IPC is not usable in this webview, and no amount of waiting helps.
+    // BEFORE it reaches Rust. IPC is not usable in this webview, ever.
     msg.includes('access control') ||
     msg.includes('ipc://')
   );
@@ -52,7 +60,13 @@ export function isIpcNotWired(err: unknown): boolean {
  */
 export function isIpcNotReady(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes('invoke_failed');
+  return (
+    msg.includes('invoke_failed') ||
+    // The handle is not registered YET. In prod it is `.manage()`d only once the
+    // operator is reachable, so this is the pre-handshake startup window — a
+    // wait, not a verdict.
+    msg.includes('state not managed')
+  );
 }
 
 /**
