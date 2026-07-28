@@ -4,7 +4,7 @@ import {
   setNativeEventSourceFallback,
   _resetIpcEventSourceFallback,
 } from './ipc-event-source';
-import { configureDesktopIpc, isRequireIpc } from './config';
+import { configureDesktopIpc, isRequireIpc, DEFAULT_REQUIRE_IPC } from './config';
 import { setIpcInspector, type IpcTraceEvent } from './ipc-inspector';
 import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
@@ -630,11 +630,11 @@ describe('IpcEventSource', () => {
       _resetIpcEventSourceFallback();
     }
 
-    it('is ON by default — an unavailable bridge NEVER yields a native EventSource', async () => {
+    it('when ON, an unavailable bridge NEVER yields a native EventSource', async () => {
       FakeNativeEventSource.created = 0;
       setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
-      // Grace 0 + no requireIpc override: the pre-WI-6512 code fell back HERE.
-      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5 });
+      // Grace 0 + requireIpc: the pre-WI-6512 code fell back HERE.
+      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5, requireIpc: true });
       try {
         const d = dispatcherFromQueue();
         const es1 = new IpcEventSource('/api/ui/intents/stream', { dispatch: d.dispatch });
@@ -662,7 +662,7 @@ describe('IpcEventSource', () => {
       globalThis.console.error = (...args: unknown[]) => {
         errors.push(String(args[0] ?? ''));
       };
-      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5 });
+      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5, requireIpc: true });
       try {
         const d = dispatcherFromQueue();
         const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
@@ -675,6 +675,15 @@ describe('IpcEventSource', () => {
         globalThis.console.error = original;
         reset();
       }
+    });
+
+    // Pins the TEMPORARY hold + the exact reason, so nobody flips it back on
+    // without doing the thing that makes it safe. Measured 2026-07-28: with
+    // requireIpc ON and the bridge not dialing, a probed EventSource stayed
+    // readyState 0 for 12s straight — a hang, not a speedup.
+    it('defaults OFF for now because the Rust IPC dial does not reconnect (WI-6512)', () => {
+      expect(DEFAULT_REQUIRE_IPC).toBe(false);
+      expect(isRequireIpc()).toBe(false);
     });
 
     it('forceHttp still overrides it, so the rollback lever keeps working', () => {

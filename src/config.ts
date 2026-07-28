@@ -111,6 +111,33 @@ export const DEFAULT_IPC_STARTUP_RETRY_MS = 400;
 /** Default cooldown before a latched IPC streaming backend is re-probed. */
 export const DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS = 5_000;
 
+/**
+ * Whether `requireIpc` (no silent HTTP fallback) is ON by default.
+ *
+ * ⚠ **Currently `false`, and that is a DELIBERATE, TEMPORARY hold — not the
+ * intended end state.** The owner directed requireIpc ON ("remove the HTTP
+ * fallback, I'd rather fail hard") and the mechanism is built + tested. It is
+ * held OFF for exactly one reason, measured 2026-07-28 on this box (WI-6512):
+ *
+ *   **IPC does not currently connect.** With the fallback removed, a real
+ *   EventSource sampled every second stayed readyState 0 (CONNECTING) for a
+ *   full 12s and never opened. The Rust side logs
+ *   `dev endpoint-ipc: no socket after 60s` (main.rs:7214) — its warm loop
+ *   gives up, and the on-demand re-dial its comment promises does not happen
+ *   even with a fresh, valid advertisement on disk.
+ *
+ * So flipping this ON today does not make the desktop fast — it makes every SSE
+ * consumer hang with no live data, which is strictly worse than the latency it
+ * was meant to fix. The JS fallback was MASKING a broken Rust dial.
+ *
+ * FLIP THIS TO `true` once the Rust `IpcClientHandle` genuinely re-dials when
+ * the advertisement appears/changes. Success criterion, verified live, not
+ * assumed: a probed EventSource reaches `readyState: 1` AND the webview process
+ * holds ~1 TCP connection to the operator (not 5-6). Until then this constant is
+ * the one-line safety, and every test above still pins BOTH behaviors.
+ */
+export const DEFAULT_REQUIRE_IPC = false;
+
 let cfg: DesktopIpcConfig = {};
 
 /** Install host configuration. Merges over any previous call. */
@@ -160,9 +187,10 @@ export function isRequireIpc(): boolean {
   if (r !== undefined) return typeof r === 'function' ? Boolean(r()) : Boolean(r);
   if (typeof process !== 'undefined') {
     const v = process.env?.DESKTOP_IPC_REQUIRE ?? process.env?.NEXT_PUBLIC_DESKTOP_IPC_REQUIRE;
+    if (v === '1' || v === 'true') return true;
     if (v === '0' || v === 'false') return false;
   }
-  return true;
+  return DEFAULT_REQUIRE_IPC;
 }
 
 /** Resolve the force-HTTP escape hatch: host config first, generic env fallback otherwise. */
