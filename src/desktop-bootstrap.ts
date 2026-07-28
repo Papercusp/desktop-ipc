@@ -167,8 +167,46 @@ export { isIpcUnavailable, isIpcNotWired, isIpcNotReady } from './ipc-availabili
 
 export function installDesktopIpcPolyfills(): InstallHandle | null {
   if (typeof window === 'undefined') return null;
+
+  // P-003(a): the egress detector installs BEFORE every remaining guard, and that
+  // ordering is the whole point.
+  //
+  // It used to sit further down, after the `!isTauri() || isForceHttp()` return —
+  // i.e. INSIDE the branch it exists to audit. That meant the one configuration
+  // where HTTP egress is guaranteed (the shell fell back to HTTP, or the rollback
+  // lever was pulled) was also the one configuration where the detector was
+  // guaranteed ABSENT. The packaged perf suite caught it on its first real run:
+  // `webview-http-egress = -1` (detector absent) rather than a count, from a shell
+  // that was in fact talking HTTP the entire time.
+  //
+  // A detector that goes quiet exactly when the fault is present is worse than no
+  // detector, because "-1/unknown" and "0/clean" are one careless `>= 0` apart.
+  // Nothing here depends on the IPC path: it is a passive PerformanceObserver over
+  // resource timings, so it is installable — and meaningful — in every shell.
+  //
+  // `buffered: true` still replays entries recorded before this call (that is what
+  // catches the known t=480-783ms offenders), so moving the install EARLIER only
+  // widens what it can see; it can never narrow it. `installEgressMonitor` is
+  // idempotent (`if (active) return active`), so the re-entry paths below are safe.
+  const expectsIpc = isTauri() && !isForceHttp();
+  const egress = installEgressMonitor({
+    onEgress: (e) => {
+      // Loudness is scoped to shells that were SUPPOSED to use IPC. In a browser
+      // (or under the deliberate forceHttp rollback) HTTP is the sanctioned
+      // transport, so an error per request would be noise — but the report is
+      // still recorded, so the invariant can always be READ.
+      if (!expectsIpc) return;
+      const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
+      host?.error?.(
+        `[desktop-ipc] HTTP EGRESS: ${e.path} went over the network stack at ` +
+          `t=${Math.round(e.startMs)}ms (${Math.round(e.durationMs)}ms). Inside the desktop ` +
+          `shell every /api call must travel over IPC — this one did not.`,
+      );
+    },
+  });
+
   if (installed) return null;
-  if (!isTauri() || isForceHttp()) return null;
+  if (!expectsIpc) return null;
 
   // Hold both the original reference (for identity-preserving uninstall)
   // and a bound version (for internal use — Tauri webviews tend to keep
@@ -296,24 +334,6 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   setNativeEventSourceFallback(OriginalEventSource);
   (window as unknown as { EventSource: typeof window.EventSource }).EventSource =
     IpcEventSource as unknown as typeof window.EventSource;
-
-  // P-003(a): watch for /api traffic that reached the real network stack. This
-  // is installed HERE, not earlier, and that is fine on purpose: the observer
-  // uses `buffered: true`, so it replays the entries recorded BEFORE this call —
-  // which is where the known offenders live (P-011: 7-9 `/api/desktop/*` calls
-  // go native at t=480-783 ms, measured 2026-07-28). An egress is logged as an
-  // ERROR because D-005 rules that HTTP from the webview is a loud failure and
-  // never a fallback; silence is what let this survive three times.
-  const egress = installEgressMonitor({
-    onEgress: (e) => {
-      const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
-      host?.error?.(
-        `[desktop-ipc] HTTP EGRESS: ${e.path} went over the network stack at ` +
-          `t=${Math.round(e.startMs)}ms (${Math.round(e.durationMs)}ms). Inside the desktop ` +
-          `shell every /api call must travel over IPC — this one did not.`,
-      );
-    },
-  });
 
   installed = true;
 

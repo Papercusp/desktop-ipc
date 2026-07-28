@@ -359,3 +359,124 @@ describe('installDesktopIpcPolyfills', () => {
     expect(fakeFetch).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * The egress detector must SURVIVE the guards that skip the polyfills.
+ *
+ * These exist because the first packaged run of the perf suite reported
+ * `webview-http-egress = -1` — the "detector absent" sentinel — from a shell that
+ * was talking HTTP the whole time. `installEgressMonitor` had been called AFTER
+ * `if (!isTauri() || isForceHttp()) return null`, i.e. inside the very branch it
+ * audits, so the one configuration where egress is guaranteed was the one
+ * configuration where the detector could not speak.
+ *
+ * Note what was and was not covered before: `classifyEgress` — the RULE — had
+ * thorough unit tests, including a fixture reproducing the real 9-request wave.
+ * Every one of them passed while the detector was, in practice, never installed.
+ * The rule was right and the wiring was wrong, so the tests below assert the
+ * WIRING: not "what does the monitor conclude" but "is the monitor there at all".
+ */
+describe('egress detector installs regardless of transport branch', () => {
+  interface FakeEntry {
+    name: string;
+    startTime: number;
+    duration: number;
+  }
+  let deliver: ((entries: FakeEntry[]) => void) | null = null;
+  let originalPO: unknown;
+
+  beforeEach(() => {
+    originalPO = (globalThis as { PerformanceObserver?: unknown }).PerformanceObserver;
+    class FakePO {
+      constructor(private readonly cb: (list: { getEntries: () => FakeEntry[] }) => void) {
+        deliver = (entries: FakeEntry[]) => this.cb({ getEntries: () => entries });
+      }
+      observe() {}
+      disconnect() {
+        deliver = null;
+      }
+    }
+    (globalThis as { PerformanceObserver?: unknown }).PerformanceObserver = FakePO;
+  });
+
+  afterEach(() => {
+    deliver = null;
+    (globalThis as { PerformanceObserver?: unknown }).PerformanceObserver = originalPO;
+    delete (globalThis as { window?: Record<string, unknown> }).window?.__papercusp_egress__;
+  });
+
+  const egressHandle = () =>
+    (globalThis as { window?: { __papercusp_egress__?: { report: () => { total: number } } } })
+      .window?.__papercusp_egress__;
+
+  it('installs the monitor even when NOT under Tauri (the branch that returned early)', () => {
+    (globalThis as { window?: TestWindow }).window!.__TAURI_INTERNALS__ = undefined;
+
+    expect(installDesktopIpcPolyfills()).toBeNull(); // polyfills still correctly skipped
+    expect(egressHandle(), 'detector must be present even with no polyfills').toBeDefined();
+    expect(egressHandle()!.report().total).toBe(0);
+  });
+
+  it('installs the monitor when the force-HTTP rollback lever is pulled', () => {
+    const prev = process.env.DESKTOP_IPC_FORCE_HTTP;
+    process.env.DESKTOP_IPC_FORCE_HTTP = '1';
+    try {
+      expect(installDesktopIpcPolyfills()).toBeNull();
+      expect(egressHandle(), 'forceHttp is the case egress matters MOST').toBeDefined();
+    } finally {
+      if (prev === undefined) delete process.env.DESKTOP_IPC_FORCE_HTTP;
+      else process.env.DESKTOP_IPC_FORCE_HTTP = prev;
+    }
+  });
+
+  it('COUNTS egress in the fallback shell — the number the suite reads is real, not -1', () => {
+    const prev = process.env.DESKTOP_IPC_FORCE_HTTP;
+    process.env.DESKTOP_IPC_FORCE_HTTP = '1';
+    try {
+      installDesktopIpcPolyfills();
+      deliver!([
+        { name: 'http://localhost:3055/api/desktop/state', startTime: 480, duration: 12 },
+        { name: 'http://localhost:3055/api/desktop/git-pipeline', startTime: 783, duration: 3632 },
+        { name: 'http://localhost:3055/assets/app.js', startTime: 20, duration: 5 },
+      ]);
+      // Two /api entries counted; the asset ignored. A detector that reported 0
+      // here would be indistinguishable from a genuinely clean shell.
+      expect(egressHandle()!.report().total).toBe(2);
+    } finally {
+      if (prev === undefined) delete process.env.DESKTOP_IPC_FORCE_HTTP;
+      else process.env.DESKTOP_IPC_FORCE_HTTP = prev;
+    }
+  });
+
+  it('stays QUIET in a shell that never promised IPC, while still counting', () => {
+    (globalThis as { window?: TestWindow }).window!.__TAURI_INTERNALS__ = undefined;
+    const errors: unknown[] = [];
+    const originalError = globalThis.console.error;
+    globalThis.console.error = (...args: unknown[]) => void errors.push(args);
+    try {
+      installDesktopIpcPolyfills();
+      deliver!([{ name: 'http://localhost:3055/api/x', startTime: 10, duration: 1 }]);
+      expect(egressHandle()!.report().total).toBe(1);
+      expect(errors, 'HTTP is sanctioned outside the desktop shell — no error spam').toHaveLength(
+        0,
+      );
+    } finally {
+      globalThis.console.error = originalError;
+    }
+  });
+
+  it('is LOUD when a shell that promised IPC lets a request escape (D-005)', () => {
+    const errors: string[] = [];
+    const originalError = globalThis.console.error;
+    globalThis.console.error = (...args: unknown[]) => void errors.push(String(args[0]));
+    try {
+      installDesktopIpcPolyfills(); // Tauri present, no forceHttp ⇒ expectsIpc
+      deliver!([
+        { name: 'http://localhost:3055/api/desktop/state', startTime: 480, duration: 12 },
+      ]);
+      expect(errors.some((e) => e.includes('HTTP EGRESS'))).toBe(true);
+    } finally {
+      globalThis.console.error = originalError;
+    }
+  });
+});
