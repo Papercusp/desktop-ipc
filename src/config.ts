@@ -114,29 +114,38 @@ export const DEFAULT_IPC_STREAM_FALLBACK_COOLDOWN_MS = 5_000;
 /**
  * Whether `requireIpc` (no silent HTTP fallback) is ON by default.
  *
- * ⚠ **Currently `false`, and that is a DELIBERATE, TEMPORARY hold — not the
- * intended end state.** The owner directed requireIpc ON ("remove the HTTP
- * fallback, I'd rather fail hard") and the mechanism is built + tested. It is
- * held OFF for exactly one reason, measured 2026-07-28 on this box (WI-6512):
+ * **`true` since 2026-07-28.** The hold that kept this `false` is gone: it was
+ * held off because IPC could not connect at all, and that turned out to be a
+ * Rust-side defect, now fixed (WI-6512).
  *
- *   **IPC does not currently connect.** With the fallback removed, a real
- *   EventSource sampled every second stayed readyState 0 (CONNECTING) for a
- *   full 12s and never opened. The Rust side logs
- *   `dev endpoint-ipc: no socket after 60s` (main.rs:7214) — its warm loop
- *   gives up, and the on-demand re-dial its comment promises does not happen
- *   even with a fresh, valid advertisement on disk.
+ * The defect, for context, because it is the reason this constant exists:
+ * `discovery_pid_alive` decided whether an endpoint-ipc advertisement was live
+ * by grepping the process cmdline for `serve.mjs`/`serve.ts` — but the process
+ * that writes the advertisement and owns the socket is the hono host. Measured
+ * 9 of 9 live operators failing that check, so `/api` classified every
+ * advertisement as a restart orphan and never dialed. The JS fallback here was
+ * MASKING that: it quietly moved every stream onto the webview's ~6-socket
+ * libsoup pool, where five long-lived SSE streams starve everything else. The
+ * owner's symptom was "clicking an agent takes several seconds"; nothing
+ * anywhere reported an error.
  *
- * So flipping this ON today does not make the desktop fast — it makes every SSE
- * consumer hang with no live data, which is strictly worse than the latency it
- * was meant to fix. The JS fallback was MASKING a broken Rust dial.
+ * The success criterion for this flip, VERIFIED LIVE on 2026-07-28 rather than
+ * assumed — in a Tauri shell against the release operator on :3070:
+ *  - six concurrent `EventSource`s all reached `readyState: 1` and held it for
+ *    the full 10s sample (before the fix: a single stream sat at readyState 0
+ *    for 12s and never opened);
+ *  - the WebKit network process held **2** TCP connections before opening
+ *    those six streams, **2** while all six were live, and **2** after — i.e.
+ *    the streams consumed no sockets, because they were on IPC.
  *
- * FLIP THIS TO `true` once the Rust `IpcClientHandle` genuinely re-dials when
- * the advertisement appears/changes. Success criterion, verified live, not
- * assumed: a probed EventSource reaches `readyState: 1` AND the webview process
- * holds ~1 TCP connection to the operator (not 5-6). Until then this constant is
- * the one-line safety, and every test above still pins BOTH behaviors.
+ * Why default ON rather than leaving the fallback as a safety net: the fallback
+ * is not a safety net, it is a silence. It degrades the app instead of failing
+ * it, so a broken transport presents as "feels slow" and survives for months.
+ * With `requireIpc`, a stream that cannot reach the bridge stays CONNECTING and
+ * retries forever (the bridge comes up and it connects), and `ipcFetch` rejects
+ * loudly. `forceHttp` remains the deliberate rollback lever.
  */
-export const DEFAULT_REQUIRE_IPC = false;
+export const DEFAULT_REQUIRE_IPC = true;
 
 let cfg: DesktopIpcConfig = {};
 
