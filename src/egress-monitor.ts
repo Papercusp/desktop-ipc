@@ -309,7 +309,7 @@ function wrapConstructor(
 
   const Wrapped = function (this: unknown, ...args: never[]) {
     try {
-      const first = args[0];
+      const first: unknown = args[0];
       if (typeof first === 'string' || first instanceof URL) onUrl(String(first));
     } catch {
       // Recording must never break the app's transport. A missed record is a
