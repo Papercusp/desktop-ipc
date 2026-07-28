@@ -72,7 +72,13 @@ function reportDeclaredHttpExemption(url: string): void {
   }
   if (reportedExemptions.has(pathname)) return;
   reportedExemptions.add(pathname);
-  const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
+  // `window.console` first, matching the console this module already patches for
+  // the Tauri warn-filter. The two are the same object in a webview, but not in
+  // a non-DOM host — and reporting through a different console than the one the
+  // shell observes is how an "it logs loudly" claim quietly becomes untrue.
+  const host =
+    (window as unknown as { console?: Console }).console ??
+    (typeof globalThis !== 'undefined' ? globalThis.console : undefined);
   host?.warn?.(
     `[desktop-ipc] DECLARED HTTP EXEMPTION: ${pathname} is staying on the native ` +
       `transport because the IPC bridge's owner is NOT the operator that served this ` +

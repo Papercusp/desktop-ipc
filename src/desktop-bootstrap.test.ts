@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { installDesktopIpcPolyfills, isIpcUnavailable, _resetForTests } from './desktop-bootstrap';
+import { configureDesktopIpc } from './config';
 import { IpcEventSource } from './ipc-event-source';
 
 describe('isIpcUnavailable — IPC-down detection that gates the native-HTTP fallback', () => {
@@ -205,6 +206,143 @@ describe('installDesktopIpcPolyfills', () => {
     handle!.uninstall();
     win.console!.warn('IPC custom protocol failed, …'); // restored → passes through now
     expect(realWarn).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * D-008: `/api/desktop/*` used to be excluded from the IPC reroute
+   * unconditionally, on every platform, forever. Measured in a live shell, that
+   * one line was the ENTIRE source of webview HTTP egress — escapes recurring on
+   * the 30 s poll tick ~30 s after the polyfill installed, i.e. never the startup
+   * race P-011 blamed. The prefix now rides IPC whenever the host can PROVE the
+   * bridge's owner is the operator that served this document.
+   */
+  describe('D-008 — /api/desktop/* rides IPC when the bridge owner is provably the content origin', () => {
+    afterEach(() => {
+      // `cfg` is module-scoped and outlives _resetForTests(); clearing the
+      // resolver keeps these cases from leaking into the suite's other tests.
+      configureDesktopIpc({ ipcOwnerIsContentOrigin: undefined });
+    });
+
+    it('routes /api/desktop/* over IPC (native NOT called) once the owner is proven to be the content origin', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      configureDesktopIpc({ ipcOwnerIsContentOrigin: () => true });
+      const handle = installDesktopIpcPolyfills();
+
+      // ipcFetch throws (no real Tauri to invoke through); what matters is that
+      // the request went to IPC and NOT to the native transport.
+      let routedThroughIpc = false;
+      try {
+        await win.fetch!('/api/desktop/dev-operators');
+      } catch {
+        routedThroughIpc = true;
+      }
+      expect(routedThroughIpc).toBe(true);
+      expect(fakeFetch).not.toHaveBeenCalled();
+
+      handle!.uninstall();
+    });
+
+    it('keeps /api/desktop/* on native when the bridge owner is a DIFFERENT operator — the case the carve-out existed for', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      configureDesktopIpc({ ipcOwnerIsContentOrigin: () => false });
+      const handle = installDesktopIpcPolyfills();
+
+      // This is the dev-box shape the original exclusion protected: routing here
+      // would 404 against a foreign build and silently hide the env-switcher bar.
+      const res = await win.fetch!('/api/desktop/dev-operators');
+      expect(await res.text()).toBe('native');
+      expect(fakeFetch).toHaveBeenCalledTimes(1);
+
+      handle!.uninstall();
+    });
+
+    it('a THROWING capability resolver falls back to native, never to IPC (the asymmetric failure direction)', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      configureDesktopIpc({
+        ipcOwnerIsContentOrigin: () => {
+          throw new Error('endpoint_ipc_status unavailable');
+        },
+      });
+      const handle = installDesktopIpcPolyfills();
+
+      // A resolver that throws must NOT be read as "same operator": a false
+      // positive routes to the wrong operator and reintroduces the silent 404,
+      // while a false negative costs exactly one native request.
+      const res = await win.fetch!('/api/desktop/version');
+      expect(await res.text()).toBe('native');
+      expect(fakeFetch).toHaveBeenCalledTimes(1);
+
+      handle!.uninstall();
+    });
+
+    it('resolves the capability ONCE for a burst of first-paint calls, not once per request', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const resolver = vi.fn(async () => false);
+      configureDesktopIpc({ ipcOwnerIsContentOrigin: resolver });
+      const handle = installDesktopIpcPolyfills();
+
+      // P-002 measured 87 keys in one hydration wave; a per-request invoke would
+      // turn one filesystem read into a stampede.
+      await Promise.all([
+        win.fetch!('/api/desktop/version'),
+        win.fetch!('/api/desktop/dev-operators'),
+        win.fetch!('/api/desktop/telemetry-config'),
+      ]);
+      expect(resolver).toHaveBeenCalledTimes(1);
+
+      handle!.uninstall();
+    });
+
+    it('announces the declared HTTP exemption ONCE per path, not once per 30s poll', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const realWarn = vi.fn();
+      (win as unknown as { console: Console }).console = { warn: realWarn } as unknown as Console;
+      configureDesktopIpc({ ipcOwnerIsContentOrigin: () => false });
+      const handle = installDesktopIpcPolyfills();
+
+      // D-005 wants every surviving HTTP route visible; these callers poll every
+      // 30s, so an unconditional log would emit thousands of identical lines and
+      // become its own kind of silence. One line per distinct path.
+      await win.fetch!('/api/desktop/version');
+      await win.fetch!('/api/desktop/version');
+      await win.fetch!('/api/desktop/version');
+      const versionWarns = realWarn.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && c[0].includes('/api/desktop/version'),
+      );
+      expect(versionWarns).toHaveLength(1);
+      expect(versionWarns[0][0]).toContain('DECLARED HTTP EXEMPTION');
+
+      // A DIFFERENT path still gets its own announcement.
+      await win.fetch!('/api/desktop/git-pipeline');
+      expect(
+        realWarn.mock.calls.filter(
+          (c) => typeof c[0] === 'string' && c[0].includes('/api/desktop/git-pipeline'),
+        ),
+      ).toHaveLength(1);
+
+      handle!.uninstall();
+    });
+
+    it('leaves NON-desktop /api/* on IPC regardless of the capability verdict', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      configureDesktopIpc({ ipcOwnerIsContentOrigin: () => false });
+      const handle = installDesktopIpcPolyfills();
+
+      // The heavy shared traffic is not content-origin-scoped, so a foreign-owner
+      // verdict must never push it back onto the libsoup pool.
+      try {
+        await win.fetch!('/api/work-items');
+      } catch {
+        /* ipcFetch throws — no real Tauri */
+      }
+      expect(fakeFetch).not.toHaveBeenCalled();
+
+      handle!.uninstall();
+    });
   });
 
   it('passes Request-form inputs straight to native fetch (Phase 1 limitation)', async () => {
