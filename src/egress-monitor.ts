@@ -507,12 +507,38 @@ export async function verifyEgressSensor(
     return { observed: false, nonce, elapsedMs: elapsed(), reason: `invalid control URL: ${base}` };
   }
 
-  try {
-    await fetch(target, { cache: 'no-store' });
-  } catch {
-    // A network-level failure is FINE: a refused connection still produces a
-    // resource-timing entry, and that entry is all the proof we need.
-  }
+  // Deliberately an <img>, NOT fetch. `window.fetch` is the very transport this
+  // audits — the IPC polyfill replaces it, so a control sent through it would be
+  // routed over IPC, produce no resource-timing entry by design, and report the
+  // sensor dead every single time. An image load bypasses the polyfill (the same
+  // reason resource timing beats a fetch counter, P-010) and was measured
+  // producing an entry with `initiatorType: 'img'`.
+  //
+  // The response does not matter: a 404 or a refused connection still produces
+  // the entry, and the entry is the whole proof.
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = (): void => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
+    try {
+      if (typeof Image === 'undefined') {
+        void fetch(target, { cache: 'no-store' }).then(done, done);
+      } else {
+        const img = new Image();
+        img.onload = done;
+        img.onerror = done;
+        img.src = target;
+      }
+    } catch {
+      done();
+    }
+    // Never hang: the poll below is what actually decides, not this.
+    setTimeout(done, Math.min(opts.timeoutMs ?? 3000, 2000));
+  });
 
   const timeoutMs = opts.timeoutMs ?? 3000;
   const pollMs = opts.pollMs ?? 25;
@@ -546,7 +572,9 @@ function defaultControlUrl(): string | null {
   if (typeof window === 'undefined') return null;
   const origin = window.location?.origin;
   const comparable = comparableOrigin(origin);
-  return comparable ? `${comparable}/api/__egress_control__` : null;
+  // Deliberately NOT under /api/: the control must be impossible to confuse with
+  // the escapes it is proving we can see, quite apart from the nonce exclusion.
+  return comparable ? `${comparable}/__egress_control__` : null;
 }
 
 /** The live report, or null when no monitor is installed (UNKNOWN, not clean). */
