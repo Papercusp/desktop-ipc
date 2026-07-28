@@ -25,6 +25,33 @@ export interface DesktopIpcConfig {
   forceHttp?: boolean | (() => boolean);
 
   /**
+   * Require IPC: NEVER silently fall back to the webview's HTTP transport.
+   * **Defaults to `true`** — the silent fallback is a footgun, not a safety net.
+   *
+   * ⚠ The fallback it disables was the single highest-cost defect this package
+   * has produced, because failing SILENTLY made it invisible for two months.
+   * Observed live 2026-07-28 (WI-6512, owner-reported): the operator was
+   * LISTENING on its IPC socket with **zero** connections to it, while the
+   * webview held 6 TCP connections carrying 5 long-lived SSE streams — i.e. the
+   * fix was installed, connected to nothing, and had reverted to the exact
+   * libsoup 6-socket exhaustion it exists to prevent, with no signal anywhere.
+   * The owner's symptom was "clicking an agent takes several seconds".
+   *
+   * With `requireIpc` on:
+   *  - **Streams** never construct a native EventSource. An unavailable bridge
+   *    stays RETRYABLE forever (the `ipc-wait` path), so a stream waits for the
+   *    bridge instead of burning one of ~6 per-host sockets for the session.
+   *    This is strictly better than falling back: the stream connects the moment
+   *    the bridge is up, and boot is unaffected.
+   *  - **Fetch** rejects loudly with a named error instead of replaying the
+   *    request over HTTP, so a broken bridge surfaces as a visible failure
+   *    rather than a slow, mysterious degradation.
+   *
+   * `forceHttp` still overrides this — it stays the deliberate rollback lever.
+   */
+  requireIpc?: boolean | (() => boolean);
+
+  /**
    * How long (ms) IPC streaming stays latched as "unavailable" — routing new
    * EventSources straight to the native ctor — after an invoke proves the
    * backend isn't answering. When the window expires the next construction
@@ -117,6 +144,25 @@ export function getIpcStartupRetryMs(): number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0
     ? v
     : DEFAULT_IPC_STARTUP_RETRY_MS;
+}
+
+/**
+ * Resolve whether IPC is REQUIRED (no silent HTTP fallback). Defaults to `true`.
+ *
+ * `forceHttp` wins: an operator who has deliberately pulled the rollback lever
+ * wants HTTP, and a require-IPC assertion on top of that would just break the
+ * escape hatch. Env opt-out (`DESKTOP_IPC_REQUIRE=0`) exists for the same
+ * no-wiring reason `DESKTOP_IPC_FORCE_HTTP` does.
+ */
+export function isRequireIpc(): boolean {
+  if (isForceHttp()) return false;
+  const r = cfg.requireIpc;
+  if (r !== undefined) return typeof r === 'function' ? Boolean(r()) : Boolean(r);
+  if (typeof process !== 'undefined') {
+    const v = process.env?.DESKTOP_IPC_REQUIRE ?? process.env?.NEXT_PUBLIC_DESKTOP_IPC_REQUIRE;
+    if (v === '0' || v === 'false') return false;
+  }
+  return true;
 }
 
 /** Resolve the force-HTTP escape hatch: host config first, generic env fallback otherwise. */

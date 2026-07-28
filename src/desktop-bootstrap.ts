@@ -26,7 +26,7 @@
  *  - Idempotent: a second call returns null without re-patching.
  */
 
-import { isForceHttp } from './config';
+import { isForceHttp, isRequireIpc } from './config';
 import { IpcEventSource, setNativeEventSourceFallback, _resetIpcEventSourceFallback } from './ipc-event-source';
 import { ipcFetch } from './ipc-fetch';
 
@@ -156,6 +156,23 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
         // string bodies, so `init` is always safe to replay.
         return ipcFetch(input, init ?? {}).catch((err: unknown) => {
           if (isIpcUnavailable(err)) {
+            // requireIpc (the DEFAULT): fail LOUD instead of silently replaying
+            // over HTTP. The silent replay is why WI-6512 survived two months of
+            // being "fixed" — the desktop kept working, just slowly, with no
+            // signal that the transport had reverted. A visible error names the
+            // real fault (the bridge) instead of presenting as mystery latency.
+            if (isRequireIpc()) {
+              const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
+              host?.error?.(
+                `[desktop-ipc] IPC bridge unavailable for ${String(input)} — refusing the ` +
+                  `HTTP fallback (requireIpc). Check that the operator's endpoint-ipc socket ` +
+                  `exists AND has connections; set DESKTOP_IPC_FORCE_HTTP=1 to roll back.`,
+              );
+              throw new Error(
+                `desktop-ipc: IPC bridge unavailable and HTTP fallback is disabled (requireIpc). ` +
+                  `Underlying: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
             return originalFetchBound(input as RequestInfo, init);
           }
           throw err;

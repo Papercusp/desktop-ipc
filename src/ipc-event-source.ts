@@ -31,6 +31,7 @@ import {
   getIpcStreamFallbackCooldownMs,
   getIpcStartupGraceMs,
   getIpcStartupRetryMs,
+  isRequireIpc,
 } from './config';
 
 /**
@@ -181,6 +182,33 @@ export class IpcEventSource extends EventTarget {
     return Date.now() - this.createdAtMs < getIpcStartupGraceMs();
   }
 
+  /** Set once this source has already reported an unavailable bridge. */
+  private warnedIpcUnavailable = false;
+
+  /**
+   * Report an IPC bridge that is unavailable PAST the startup grace, once per
+   * source. Under `requireIpc` this is no longer a quiet internal fallback — it
+   * is the operator-visible signal that the desktop is degraded, and the thing
+   * whose absence let WI-6512 hide for two months.
+   *
+   * Deliberately `console.error`, not `warn`: the console is already noisy and a
+   * warn reads as routine. Also emits an `ipc-unavailable` trace so the
+   * inspector can surface it in-app rather than only in devtools.
+   */
+  private warnIpcUnavailableOnce(detail: string): void {
+    if (this.warnedIpcUnavailable) return;
+    this.warnedIpcUnavailable = true;
+    emitIpcTrace({ kind: 'es-error', id: this.traceId, path: this.url });
+    const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
+    host?.error?.(
+      `[desktop-ipc] IPC bridge unavailable for ${this.url} — holding the stream ` +
+        `CONNECTING and retrying (requireIpc). NOT falling back to HTTP: a fallback ` +
+        `stream would consume one of ~6 per-host webview sockets for the session ` +
+        `and silently reintroduce WI-6512. Check that the operator's endpoint-ipc ` +
+        `socket exists AND has connections. Detail: ${detail}`,
+    );
+  }
+
   constructor(url: string | URL, init?: IpcEventSourceOptions) {
     super();
     this.url = url.toString();
@@ -197,7 +225,17 @@ export class IpcEventSource extends EventTarget {
     // Once the cooldown expires this falls through and re-probes IPC, which is
     // what lets a boot-window failure heal instead of stranding every stream on
     // native HTTP for the life of the webview (WI-6255).
-    if (ipcStreamingLatched() && nativeEventSourceCtor && !init?.dispatch) {
+    //
+    // ⚠ Skipped entirely under `isRequireIpc()` (the DEFAULT): a stream that
+    // falls back holds one of libsoup's ~6 per-host sockets for the whole
+    // session, which is the bug this package exists to prevent. Waiting for the
+    // bridge is strictly better for a stream that will live for hours.
+    if (
+      !isRequireIpc() &&
+      ipcStreamingLatched() &&
+      nativeEventSourceCtor &&
+      !init?.dispatch
+    ) {
       return new nativeEventSourceCtor(this.url, {
         withCredentials: this.withCredentials,
       }) as unknown as IpcEventSource;
@@ -365,6 +403,13 @@ export class IpcEventSource extends EventTarget {
           // A non-IPC-unavailable error is a transient drop → reconnect.
           if (isIpcUnavailableMessage(`${ev.code} ${ev.message}`)) {
             if (this.inStartupGrace()) return 'ipc-wait';
+            // requireIpc: never burn a socket on native HTTP. Stay retryable
+            // forever and say so LOUDLY — a silent revert to HTTP is what hid
+            // this defect for two months (WI-6512).
+            if (isRequireIpc()) {
+              this.warnIpcUnavailableOnce(`${ev.code} ${ev.message}`);
+              return 'ipc-wait';
+            }
             latchIpcUnavailable();
             this.terminate();
             return 'fatal';
@@ -381,6 +426,10 @@ export class IpcEventSource extends EventTarget {
         // Unavailable backend that THREW rather than yielding an error. Same
         // startup-grace rule as the yielded-error path above.
         if (this.inStartupGrace()) return 'ipc-wait';
+        if (isRequireIpc()) {
+          this.warnIpcUnavailableOnce(msg);
+          return 'ipc-wait';
+        }
         latchIpcUnavailable();
         this.terminate();
         return 'fatal';
