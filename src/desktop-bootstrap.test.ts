@@ -142,14 +142,17 @@ describe('installDesktopIpcPolyfills', () => {
     handle!.uninstall();
   });
 
-  it('routes same-origin /api/desktop/* via NATIVE fetch, NOT ipcFetch (content-origin endpoints must hit the operator serving THIS webview)', async () => {
+  it('with NO content-origin capability configured, routes /api/desktop/* via NATIVE fetch (the conservative default)', async () => {
     const win = (globalThis as { window?: TestWindow }).window!;
     const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
     const handle = installDesktopIpcPolyfills();
 
     // /api/desktop/dev-operators describes the LOCAL operator — IPC-rerouting it
     // to the (possibly different) IPC-owning operator makes it 404 + the env
-    // switcher bar silently self-hides. So it MUST go straight to native fetch.
+    // switcher bar silently self-hides. Absent a host-supplied capability proving
+    // the IPC owner IS this document's operator, we cannot tell those apart, so
+    // the unconfigured default stays native. D-008 gates the IPC route on that
+    // capability rather than excluding the prefix unconditionally.
     const res = await win.fetch!('/api/desktop/dev-operators');
     expect(await res.text()).toBe('native');
     expect(fakeFetch).toHaveBeenCalledTimes(1);

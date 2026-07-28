@@ -90,7 +90,43 @@ export interface DesktopIpcConfig {
    * Default {@link DEFAULT_IPC_STARTUP_RETRY_MS}.
    */
   ipcStartupRetryMs?: number;
+
+  /**
+   * Path prefixes whose meaning is bound to the CONTENT ORIGIN — the operator
+   * that served this document — rather than to whichever operator happens to own
+   * the IPC bridge. Default {@link DEFAULT_CONTENT_ORIGIN_API_PREFIXES}.
+   *
+   * These may only ride IPC when {@link ipcOwnerIsContentOrigin} proves the two
+   * are the same process; otherwise they must stay on the native transport, or
+   * they hit a foreign operator that may not serve them at all.
+   */
+  contentOriginApiPrefixes?: string[];
+
+  /**
+   * Resolve whether the IPC bridge's owner is provably the operator that served
+   * this document. Host-supplied because only the host can ask its own shell
+   * (on Tauri: `endpoint_ipc_status().owner_is_content_origin`).
+   *
+   * Awaited ONCE and cached for the session — the underlying answer is fixed by
+   * how the socket was discovered, not by connection state. Left unconfigured it
+   * resolves `false`, which keeps the pre-D-008 behaviour (content-origin-scoped
+   * paths stay on the native transport) rather than guessing.
+   *
+   * ⚠ A resolver that throws is treated as `false`, never as `true`: routing a
+   * content-origin-scoped call to a foreign operator produces a silent 404 that
+   * hides UI, which is strictly worse than one native HTTP request.
+   */
+  ipcOwnerIsContentOrigin?: () => boolean | Promise<boolean>;
 }
+
+/**
+ * Prefixes bound to the serving operator rather than the IPC owner.
+ *
+ * `/api/desktop/*` describes the operator SERVING THIS WEBVIEW — its version,
+ * env list, setup state, pipeline. On a dev box the IPC bridge may target a
+ * different build, where these 404 and silently hide the env-switcher bar.
+ */
+export const DEFAULT_CONTENT_ORIGIN_API_PREFIXES = ['/api/desktop/'] as const;
 
 /**
  * Default startup grace before a stream gives up on IPC and falls back.
@@ -152,6 +188,56 @@ let cfg: DesktopIpcConfig = {};
 /** Install host configuration. Merges over any previous call. */
 export function configureDesktopIpc(config: DesktopIpcConfig): void {
   cfg = { ...cfg, ...config };
+  // A new resolver invalidates the cached verdict — otherwise a host that
+  // configures the seam AFTER the first content-origin fetch would be pinned to
+  // the unconfigured `false` for the life of the session.
+  if ('ipcOwnerIsContentOrigin' in config) ownerIsContentOrigin = null;
+}
+
+/** Path prefixes bound to the content origin. Host config first, default otherwise. */
+export function getContentOriginApiPrefixes(): readonly string[] {
+  const p = cfg.contentOriginApiPrefixes;
+  return Array.isArray(p) ? p : DEFAULT_CONTENT_ORIGIN_API_PREFIXES;
+}
+
+/** True when `pathname` is bound to the content origin rather than the IPC owner. */
+export function isContentOriginScopedPath(pathname: string): boolean {
+  return getContentOriginApiPrefixes().some((prefix) => pathname.startsWith(prefix));
+}
+
+/**
+ * Cached session verdict. `null` = not yet asked; the in-flight promise is
+ * cached too, so a burst of first-paint requests shares ONE resolution instead
+ * of each firing its own invoke.
+ */
+let ownerIsContentOrigin: Promise<boolean> | null = null;
+
+/**
+ * Resolve (once per session) whether the IPC owner is the content origin.
+ *
+ * Never rejects: a throwing or non-boolean resolver yields `false`, because the
+ * failure direction matters — see {@link DesktopIpcConfig.ipcOwnerIsContentOrigin}.
+ */
+export function resolveIpcOwnerIsContentOrigin(): Promise<boolean> {
+  if (ownerIsContentOrigin) return ownerIsContentOrigin;
+  const resolver = cfg.ipcOwnerIsContentOrigin;
+  if (!resolver) {
+    ownerIsContentOrigin = Promise.resolve(false);
+    return ownerIsContentOrigin;
+  }
+  ownerIsContentOrigin = (async () => {
+    try {
+      return (await resolver()) === true;
+    } catch {
+      return false;
+    }
+  })();
+  return ownerIsContentOrigin;
+}
+
+/** Internal — tests reset the cached session verdict. */
+export function _resetContentOriginCacheForTests(): void {
+  ownerIsContentOrigin = null;
 }
 
 /**

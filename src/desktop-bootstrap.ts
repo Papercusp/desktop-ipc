@@ -26,7 +26,13 @@
  *  - Idempotent: a second call returns null without re-patching.
  */
 
-import { isForceHttp, isRequireIpc } from './config';
+import {
+  _resetContentOriginCacheForTests,
+  isContentOriginScopedPath,
+  isForceHttp,
+  isRequireIpc,
+  resolveIpcOwnerIsContentOrigin,
+} from './config';
 import { installEgressMonitor } from './egress-monitor';
 import { isIpcNotWired, isIpcUnavailable } from './ipc-availability';
 import { IpcEventSource, setNativeEventSourceFallback, _resetIpcEventSourceFallback } from './ipc-event-source';
@@ -37,6 +43,43 @@ interface InstallHandle {
 }
 
 let installed = false;
+
+/** Paths already reported as running on the declared HTTP exemption. */
+const reportedExemptions = new Set<string>();
+
+/**
+ * Announce, ONCE per path, that a request is taking the one remaining native-HTTP
+ * route inside the shell.
+ *
+ * D-005 rules that HTTP from the webview is a loud failure and never a silent
+ * fallback — the silence is the whole reason WI-6512 survived two months. But
+ * these callers poll every 30 s, so an unconditional log would emit thousands of
+ * identical lines and become its own kind of silence. Deduping by path keeps the
+ * signal readable while still naming every escaping endpoint exactly once.
+ *
+ * `warn`, not `error`: unlike an unexplained egress this route is DECLARED and
+ * its cause is known (the IPC bridge belongs to a different operator than the one
+ * serving this document), so it is a diagnosable condition rather than a defect
+ * in the transport. A genuine unexplained escape is still logged as an error by
+ * the egress monitor below.
+ */
+function reportDeclaredHttpExemption(url: string): void {
+  let pathname = url;
+  try {
+    pathname = new URL(url, window.location.origin).pathname;
+  } catch {
+    /* keep the raw string — a malformed URL is still worth naming once */
+  }
+  if (reportedExemptions.has(pathname)) return;
+  reportedExemptions.add(pathname);
+  const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
+  host?.warn?.(
+    `[desktop-ipc] DECLARED HTTP EXEMPTION: ${pathname} is staying on the native ` +
+      `transport because the IPC bridge's owner is NOT the operator that served this ` +
+      `document, and this path describes the serving operator. This is the only ` +
+      `sanctioned HTTP route in the shell; every other /api call must ride IPC.`,
+  );
+}
 
 function isTauri(): boolean {
   if (typeof window === 'undefined') return false;
@@ -51,18 +94,36 @@ function isSameOriginApiPath(url: string | URL): boolean {
   try {
     const u = new URL(typeof url === 'string' ? url : url.toString(), window.location.origin);
     if (u.origin !== window.location.origin) return false;
-    // `/api/desktop/*` describes the operator SERVING THIS webview (its version,
-    // env list, setup state, voice port, pipeline) — so it MUST hit the content
-    // origin, NOT the IPC-owning operator the reroute targets. On the dev box the
-    // IPC owner is often a DIFFERENT build (a sibling on another port) that may not
-    // even serve these endpoints → 404, which silently HIDES the env-switcher bar
-    // (it self-hides when /api/desktop/dev-operators returns no data). These are a
-    // few small one-shot/30s polls, so native HTTP is cheap; the IPC reroute (the
-    // libsoup SSE-socket-starvation fix) stays for the heavy shared /api traffic.
-    // Holds in public release too: there's no reroute there, so native = the only
-    // operator. See agent-insights/verifying-desktop-fixes-on-the-right-instance.
-    if (u.pathname.startsWith('/api/desktop/')) return false;
     return u.pathname.startsWith('/api/');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when this same-origin /api path is bound to the operator that SERVED this
+ * document rather than to whichever operator owns the IPC bridge.
+ *
+ * This used to be an unconditional `return false` for the whole `/api/desktop/*`
+ * prefix inside {@link isSameOriginApiPath} — a permanent, undeclared HTTP
+ * carve-out on every platform. D-008 measured what that cost: it is the ENTIRE
+ * reason webview HTTP egress is nonzero. The escapes recur on the 30 s poll tick
+ * ~30 s after the polyfill installs (t=31029/31040/31714 ms, with `window.fetch`
+ * confirmed patched), so they were never the startup race P-011 blamed — earlier
+ * installation would not have stopped one of them.
+ *
+ * The underlying concern was real: these endpoints describe the serving operator,
+ * and on a dev box the IPC bridge may target a different build where they 404 and
+ * silently hide the env-switcher bar. So the prefix is no longer excluded — it is
+ * routed on a DECLARED capability the Rust resolver already computes
+ * (`SocketResolution::owner_is_content_origin`), satisfying D-005's requirement
+ * that any surviving HTTP path be explicit rather than inferred.
+ */
+function isContentOriginScopedApiPath(url: string | URL): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const u = new URL(typeof url === 'string' ? url : url.toString(), window.location.origin);
+    return isContentOriginScopedPath(u.pathname);
   } catch {
     return false;
   }
@@ -111,6 +172,43 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   const originalFetchBound = originalFetchRef.bind(window);
   const OriginalEventSource = window.EventSource;
 
+  /**
+   * Route one same-origin /api request over IPC, falling back to the native
+   * transport only when the bridge itself is unavailable.
+   *
+   * Shared by both /api branches so the requireIpc rules cannot drift apart
+   * between them — a content-origin-scoped call that reaches IPC must fail as
+   * loudly as any other, per D-005.
+   */
+  const ipcFetchWithFallback = (input: string | URL, init?: RequestInit): Promise<Response> =>
+    ipcFetch(input, init ?? {}).catch((err: unknown) => {
+      if (isIpcUnavailable(err)) {
+        // requireIpc (the DEFAULT): fail LOUD instead of silently replaying
+        // over HTTP. The silent replay is why WI-6512 survived two months of
+        // being "fixed" — the desktop kept working, just slowly, with no
+        // signal that the transport had reverted. A visible error names the
+        // real fault (the bridge) instead of presenting as mystery latency.
+        // Not-wired (PAPERCUSP_DESKTOP_IPC=0, no IPC in this build, a
+        // webview refusing ipc://) is the operator deliberately choosing
+        // HTTP — same meaning as forceHttp, so honour it rather than
+        // erroring every /api call for the life of the process.
+        if (isRequireIpc() && !isIpcNotWired(err)) {
+          const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
+          host?.error?.(
+            `[desktop-ipc] IPC bridge unavailable for ${String(input)} — refusing the ` +
+              `HTTP fallback (requireIpc). Check that the operator's endpoint-ipc socket ` +
+              `exists AND has connections; set DESKTOP_IPC_FORCE_HTTP=1 to roll back.`,
+          );
+          throw new Error(
+            `desktop-ipc: IPC bridge unavailable and HTTP fallback is disabled (requireIpc). ` +
+              `Underlying: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        return originalFetchBound(input as RequestInfo, init);
+      }
+      throw err;
+    });
+
   // Patch fetch: same-origin /api/* → ipcFetch; everything else native.
   // Reject the Request-form input by falling through to native — Phase 1
   // ipcFetch wants a URL + init, and converting a Request faithfully
@@ -138,38 +236,28 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
           ),
         );
       }
+      if (isSameOriginApiPath(input) && isContentOriginScopedApiPath(input)) {
+        // Content-origin-scoped: ride IPC only when the bridge's owner is PROVABLY
+        // the operator that served this document. Awaiting rather than reading a
+        // cached-or-default flag is deliberate — a synchronous check would answer
+        // "unknown" for the whole startup window, which is exactly when the
+        // first-paint burst of these calls happens, so the carve-out would survive
+        // in miniature for the requests that matter most. The resolution is one
+        // filesystem-backed invoke, cached for the session, shared by all callers.
+        return resolveIpcOwnerIsContentOrigin().then((sameOperator) => {
+          if (!sameOperator) {
+            reportDeclaredHttpExemption(String(input));
+            return originalFetchBound(input as RequestInfo, init);
+          }
+          return ipcFetchWithFallback(input, init);
+        });
+      }
       if (isSameOriginApiPath(input)) {
         // Try IPC; if the IPC backend isn't available (dev mode has no
         // sidecar; prod has a startup window before the handshake),
         // fall back to a direct HTTP fetch. ipcFetch only accepts
         // string bodies, so `init` is always safe to replay.
-        return ipcFetch(input, init ?? {}).catch((err: unknown) => {
-          if (isIpcUnavailable(err)) {
-            // requireIpc (the DEFAULT): fail LOUD instead of silently replaying
-            // over HTTP. The silent replay is why WI-6512 survived two months of
-            // being "fixed" — the desktop kept working, just slowly, with no
-            // signal that the transport had reverted. A visible error names the
-            // real fault (the bridge) instead of presenting as mystery latency.
-            // Not-wired (PAPERCUSP_DESKTOP_IPC=0, no IPC in this build, a
-            // webview refusing ipc://) is the operator deliberately choosing
-            // HTTP — same meaning as forceHttp, so honour it rather than
-            // erroring every /api call for the life of the process.
-            if (isRequireIpc() && !isIpcNotWired(err)) {
-              const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
-              host?.error?.(
-                `[desktop-ipc] IPC bridge unavailable for ${String(input)} — refusing the ` +
-                  `HTTP fallback (requireIpc). Check that the operator's endpoint-ipc socket ` +
-                  `exists AND has connections; set DESKTOP_IPC_FORCE_HTTP=1 to roll back.`,
-              );
-              throw new Error(
-                `desktop-ipc: IPC bridge unavailable and HTTP fallback is disabled (requireIpc). ` +
-                  `Underlying: ${err instanceof Error ? err.message : String(err)}`,
-              );
-            }
-            return originalFetchBound(input as RequestInfo, init);
-          }
-          throw err;
-        });
+        return ipcFetchWithFallback(input, init);
       }
     }
     return originalFetchBound(input as RequestInfo, init);
@@ -241,5 +329,7 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
 /** Internal — tests reset module state. */
 export function _resetForTests(): void {
   installed = false;
+  reportedExemptions.clear();
+  _resetContentOriginCacheForTests();
   _resetIpcEventSourceFallback();
 }
