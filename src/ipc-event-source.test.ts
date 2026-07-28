@@ -4,7 +4,7 @@ import {
   setNativeEventSourceFallback,
   _resetIpcEventSourceFallback,
 } from './ipc-event-source';
-import { configureDesktopIpc } from './config';
+import { configureDesktopIpc, isRequireIpc } from './config';
 import { setIpcInspector, type IpcTraceEvent } from './ipc-inspector';
 import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
@@ -358,7 +358,10 @@ describe('IpcEventSource', () => {
     setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
     // Grace 0: exercise the post-grace "IPC is dead" path directly. With the
     // default grace an invoke_failed is RETRIED rather than terminal (WI-6257).
-    configureDesktopIpc({ ipcStartupGraceMs: 0 });
+    // requireIpc:false — this test pins the LEGACY fallback path, which now only
+    // runs behind the rollback lever. The default (requireIpc) never falls back;
+    // that is pinned separately in the 'requireIpc' describe below (WI-6512).
+    configureDesktopIpc({ ipcStartupGraceMs: 0, requireIpc: false });
     try {
       // 1st construction: injected dispatch yields the unwired-backend error
       // (ipc-stream emits {kind:'error', code:'invoke_failed'}), latching the
@@ -379,7 +382,7 @@ describe('IpcEventSource', () => {
       expect(created[0].url).toContain('/api/ui/intents/stream');
       expect(created[0].withCredentials).toBe(true);
     } finally {
-      configureDesktopIpc({ ipcStartupGraceMs: undefined });
+      configureDesktopIpc({ ipcStartupGraceMs: undefined, requireIpc: undefined });
       _resetIpcEventSourceFallback();
     }
   });
@@ -417,9 +420,12 @@ describe('IpcEventSource', () => {
       FakeNativeEventSource.created = [];
       // Grace 0 so an invoke_failed latches immediately — these tests are about
       // the COOLDOWN, not the WI-6257 startup grace (covered separately below).
+      // requireIpc:false — the cooldown only governs the LEGACY fallback path
+      // (under the default there is no fallback to cool down). WI-6512.
       configureDesktopIpc({
         ipcStreamFallbackCooldownMs: cooldownMs,
         ipcStartupGraceMs: 0,
+        requireIpc: false,
       });
       setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
     }
@@ -428,6 +434,7 @@ describe('IpcEventSource', () => {
       configureDesktopIpc({
         ipcStreamFallbackCooldownMs: undefined,
         ipcStartupGraceMs: undefined,
+        requireIpc: undefined,
       });
       _resetIpcEventSourceFallback();
     }
@@ -511,7 +518,11 @@ describe('IpcEventSource', () => {
   // the stream must WAIT for IPC rather than buy data with a permanent socket.
   describe('IPC startup grace (WI-6257)', () => {
     function reset(): void {
-      configureDesktopIpc({ ipcStartupGraceMs: undefined, ipcStartupRetryMs: undefined });
+      configureDesktopIpc({
+        ipcStartupGraceMs: undefined,
+        ipcStartupRetryMs: undefined,
+        requireIpc: undefined,
+      });
       _resetIpcEventSourceFallback();
     }
 
@@ -569,10 +580,11 @@ describe('IpcEventSource', () => {
       }
     });
 
-    it('still latches + falls back once the grace has expired', async () => {
+    it('still latches + falls back once the grace has expired (requireIpc off)', async () => {
       // Grace 0 = the pre-WI-6257 semantics, which must be preserved for a
-      // genuinely dead bridge (a stale advertisement, an unwired backend).
-      configureDesktopIpc({ ipcStartupGraceMs: 0 });
+      // genuinely dead bridge (a stale advertisement, an unwired backend) —
+      // but only behind the rollback lever now (WI-6512).
+      configureDesktopIpc({ ipcStartupGraceMs: 0, requireIpc: false });
       try {
         const d = dispatcherFromQueue();
         const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
@@ -581,6 +593,96 @@ describe('IpcEventSource', () => {
         expect(es.readyState).toBe(2);
       } finally {
         reset();
+      }
+    });
+  });
+
+  // WI-6512 (owner-reported 2026-07-28) — requireIpc is the DEFAULT, and it
+  // removes the native-HTTP fallback for streams entirely.
+  //
+  // Why this exists: the fallback failed SILENTLY, so a bridge that never
+  // connected looked exactly like a working desktop that was merely slow. Found
+  // live with the operator LISTENING on its endpoint-ipc socket with zero
+  // connections while the webview carried 5 long-lived SSE streams over TCP —
+  // libsoup's ~6-socket pool exhausted, every ordinary request queued behind
+  // them for seconds. The library had "fixed" that in May; the fallback quietly
+  // reverted it and nothing anywhere said so.
+  //
+  // A stream that waits is strictly better than a stream that falls back: it
+  // costs nothing while the bridge comes up, and it connects the moment it does.
+  describe('requireIpc — no silent HTTP fallback (WI-6512)', () => {
+    class FakeNativeEventSource {
+      static created = 0;
+      constructor() {
+        FakeNativeEventSource.created += 1;
+      }
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      close(): void {}
+    }
+
+    function reset(): void {
+      configureDesktopIpc({
+        ipcStartupGraceMs: undefined,
+        ipcStartupRetryMs: undefined,
+        requireIpc: undefined,
+      });
+      _resetIpcEventSourceFallback();
+    }
+
+    it('is ON by default — an unavailable bridge NEVER yields a native EventSource', async () => {
+      FakeNativeEventSource.created = 0;
+      setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
+      // Grace 0 + no requireIpc override: the pre-WI-6512 code fell back HERE.
+      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5 });
+      try {
+        const d = dispatcherFromQueue();
+        const es1 = new IpcEventSource('/api/ui/intents/stream', { dispatch: d.dispatch });
+        d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+
+        // Stays CONNECTING and retries rather than going terminal.
+        await new Promise((r) => setTimeout(r, 40));
+        expect(es1.readyState).toBe(0);
+        es1.close();
+
+        // And a later construction still builds an IpcEventSource, never a
+        // native one — no latch was set, so no socket is ever burned.
+        const es2 = new IpcEventSource('/api/ui/intents/stream');
+        expect(es2).toBeInstanceOf(IpcEventSource);
+        expect(FakeNativeEventSource.created).toBe(0);
+        es2.close();
+      } finally {
+        reset();
+      }
+    });
+
+    it('reports the degraded bridge LOUDLY instead of hiding it', async () => {
+      const errors: string[] = [];
+      const original = globalThis.console.error;
+      globalThis.console.error = (...args: unknown[]) => {
+        errors.push(String(args[0] ?? ''));
+      };
+      configureDesktopIpc({ ipcStartupGraceMs: 0, ipcStartupRetryMs: 5 });
+      try {
+        const d = dispatcherFromQueue();
+        const es = new IpcEventSource('/api/sync/stream', { dispatch: d.dispatch });
+        d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+        await waitFor(() => errors.length > 0);
+        expect(errors[0]).toContain('IPC bridge unavailable');
+        expect(errors[0]).toContain('/api/sync/stream');
+        es.close();
+      } finally {
+        globalThis.console.error = original;
+        reset();
+      }
+    });
+
+    it('forceHttp still overrides it, so the rollback lever keeps working', () => {
+      configureDesktopIpc({ requireIpc: true, forceHttp: true });
+      try {
+        expect(isRequireIpc()).toBe(false);
+      } finally {
+        configureDesktopIpc({ requireIpc: undefined, forceHttp: undefined });
       }
     });
   });
