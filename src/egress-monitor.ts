@@ -448,6 +448,20 @@ export interface SensorProofOptions {
 
 export interface SensorProofResult {
   observed: boolean;
+  /**
+   * Whether the control request was actually EMITTED — false when this returned
+   * before sending anything (no usable control URL, no resource-timing API).
+   *
+   * Reported structurally rather than left to be inferred from {@link reason},
+   * because `observed: false` covers two failures that need OPPOSITE fixes:
+   * "the control was sent and the sensor missed it" (the sensor is blind — fix
+   * the sensor) versus "no control was ever sent" (the sensor is unproven, and
+   * says nothing either way — fix the caller's configuration). A caller that
+   * cannot tell them apart reports the first while the second is true, which is
+   * exactly the conflation the egress spec exists to prevent, reappearing inside
+   * the sensor's own proof (2026-08-01).
+   */
+  issued: boolean;
   nonce: string;
   elapsedMs: number;
   /** Why it failed, when it did. */
@@ -481,11 +495,23 @@ export async function verifyEgressSensor(
   const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
   if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
-    return { observed: false, nonce, elapsedMs: elapsed(), reason: 'no resource timing API' };
+    return {
+      observed: false,
+      issued: false,
+      nonce,
+      elapsedMs: elapsed(),
+      reason: 'no resource timing API',
+    };
   }
   const base = opts.controlUrl ?? defaultControlUrl();
   if (!base) {
-    return { observed: false, nonce, elapsedMs: elapsed(), reason: 'no control URL available' };
+    return {
+      observed: false,
+      issued: false,
+      nonce,
+      elapsedMs: elapsed(),
+      reason: 'no control URL available',
+    };
   }
 
   let target: string;
@@ -494,6 +520,7 @@ export async function verifyEgressSensor(
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
       return {
         observed: false,
+        issued: false,
         nonce,
         elapsedMs: elapsed(),
         // A non-http control cannot prove anything: those schemes are exactly
@@ -504,7 +531,13 @@ export async function verifyEgressSensor(
     u.searchParams.set(EGRESS_CONTROL_PARAM, nonce);
     target = u.href;
   } catch {
-    return { observed: false, nonce, elapsedMs: elapsed(), reason: `invalid control URL: ${base}` };
+    return {
+      observed: false,
+      issued: false,
+      nonce,
+      elapsedMs: elapsed(),
+      reason: `invalid control URL: ${base}`,
+    };
   }
 
   // Deliberately an <img>, NOT fetch. `window.fetch` is the very transport this
@@ -549,11 +582,12 @@ export async function verifyEgressSensor(
       .some((e) => (e as unknown as ResourceTimingLike).name.includes(nonce));
     if (hit) {
       sensorState.controlObserved = true;
-      return { observed: true, nonce, elapsedMs: elapsed() };
+      return { observed: true, issued: true, nonce, elapsedMs: elapsed() };
     }
     if (elapsed() >= deadline) {
       return {
         observed: false,
+        issued: true,
         nonce,
         elapsedMs: elapsed(),
         reason: `control request never appeared in resource timing within ${timeoutMs}ms — the sensor cannot be trusted`,
