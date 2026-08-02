@@ -283,6 +283,7 @@ export function classifyEgress(
 ): EgressReport {
   const exempt = opts.exemptPrefixes ?? [];
   const restrictTo = comparableOrigin(opts.documentOrigin);
+  const allowedOrigins = new Set(opts.allowedOrigins ?? []);
   const report: EgressReport = {
     verdict: 'unknown',
     total: 0,
@@ -290,6 +291,13 @@ export function classifyEgress(
     firstAtMs: null,
     entries: [],
     sensor,
+    foreignOrigin: {
+      verdict: 'unknown',
+      total: 0,
+      byOrigin: {},
+      firstAtMs: null,
+      entries: [],
+    },
   };
 
   for (const e of entries) {
@@ -305,12 +313,43 @@ export function classifyEgress(
     // Only a real network scheme is egress. A `papercusp://`, `blob:` or `data:`
     // load never touched the network stack, so it cannot be an escape.
     if (!NETWORK_SCHEMES.has(url.protocol)) continue;
-    // Same-origin narrowing ONLY when the document itself has an http origin.
-    if (restrictTo && url.origin !== restrictTo) continue;
-    // Never count the sensor's own proof-of-life request against the invariant.
+    // Never count the sensor's own proof-of-life request against either axis.
     if (url.searchParams.has(EGRESS_CONTROL_PARAM)) continue;
 
     const path = url.pathname;
+
+    // ---- DESTINATION AXIS (foreign-origin) --------------------------------
+    // MUST run BEFORE the same-origin narrowing below. That narrowing belongs to
+    // the transport axis and discards precisely the foreign origins this axis
+    // exists to catch — running it first is the exact bug that made the monitor
+    // blind to six public-CDN fetches for months.
+    if (!LOCAL_HOSTNAMES.has(url.hostname) && !allowedOrigins.has(url.origin)) {
+      const foreign: EgressEntry = {
+        path,
+        url: url.href,
+        startMs: e.startTime,
+        durationMs: e.duration,
+        via: e.via ?? 'resource-timing',
+        axis: 'foreign-origin',
+      };
+      const f = report.foreignOrigin;
+      f.total++;
+      const agg = f.byOrigin[url.origin] ?? {
+        count: 0,
+        firstAtMs: e.startTime,
+        sampleUrl: url.href,
+      };
+      agg.count++;
+      if (e.startTime < agg.firstAtMs) agg.firstAtMs = e.startTime;
+      f.byOrigin[url.origin] = agg;
+      if (f.firstAtMs === null || e.startTime < f.firstAtMs) f.firstAtMs = e.startTime;
+      f.entries.push(foreign);
+    }
+
+    // ---- TRANSPORT AXIS (ipc-escape) — unchanged --------------------------
+    // Same-origin narrowing ONLY when the document itself has an http origin.
+    if (restrictTo && url.origin !== restrictTo) continue;
+
     if (!path.startsWith(API_PREFIX)) continue;
     if (exempt.some((p) => path.startsWith(p))) continue;
 
@@ -320,6 +359,7 @@ export function classifyEgress(
       startMs: e.startTime,
       durationMs: e.duration,
       via: e.via ?? 'resource-timing',
+      axis: 'ipc-escape',
     };
     report.total++;
     const agg = report.byPath[path] ?? { count: 0, totalMs: 0, firstAtMs: e.startTime };
@@ -334,10 +374,21 @@ export function classifyEgress(
   if (report.entries.length > EGRESS_RING_SIZE) {
     report.entries = report.entries.slice(-EGRESS_RING_SIZE);
   }
+  report.foreignOrigin.entries.sort((a, b) => a.startMs - b.startMs);
+  if (report.foreignOrigin.entries.length > EGRESS_RING_SIZE) {
+    report.foreignOrigin.entries = report.foreignOrigin.entries.slice(-EGRESS_RING_SIZE);
+  }
 
   // A positive observation stands on its own. A NEGATIVE one is only worth
   // something from a sensor we proved was alive.
   report.verdict = report.total > 0 ? 'breach' : sensor.controlObserved ? 'clean' : 'unknown';
+  // The SAME three-valued discipline on the new axis, for the same reason: a
+  // zero from an unproven sensor is what a dead detector reports, and reading it
+  // as "no CDN fetches" is precisely the false all-clear this axis was added to
+  // stop. The two verdicts are deliberately independent — one axis can be clean
+  // while the other breaches.
+  report.foreignOrigin.verdict =
+    report.foreignOrigin.total > 0 ? 'breach' : sensor.controlObserved ? 'clean' : 'unknown';
   return report;
 }
 
@@ -410,7 +461,11 @@ export function installEgressMonitor(opts: EgressOptions = {}): EgressMonitorHan
   const seen: ResourceTimingLike[] = [];
   const documentOrigin = opts.documentOrigin ?? window.location?.origin;
   const options: EgressOptions = { ...opts, documentOrigin };
-  let reported = 0;
+  // One high-water mark PER AXIS. A single shared counter would let a burst on
+  // one axis suppress announcements on the other, which is the sort of quiet
+  // under-reporting this whole file exists to avoid.
+  let reportedIpc = 0;
+  let reportedForeign = 0;
 
   const state: EgressSensorState = {
     controlObserved: false,
@@ -422,8 +477,12 @@ export function installEgressMonitor(opts: EgressOptions = {}): EgressMonitorHan
   const reclassify = (): void => {
     const r = classifyEgress(seen, options, state);
     // Announce only what is NEW, so a repeated buffered replay cannot spam.
-    for (let i = reported; i < r.entries.length; i++) opts.onEgress?.(r.entries[i]);
-    reported = r.entries.length;
+    for (let i = reportedIpc; i < r.entries.length; i++) opts.onEgress?.(r.entries[i]);
+    reportedIpc = r.entries.length;
+    for (let i = reportedForeign; i < r.foreignOrigin.entries.length; i++) {
+      opts.onEgress?.(r.foreignOrigin.entries[i]);
+    }
+    reportedForeign = r.foreignOrigin.entries.length;
   };
 
   const push = (e: ResourceTimingLike): void => {

@@ -191,12 +191,31 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   const expectsIpc = isTauri() && !isForceHttp();
   const egress = installEgressMonitor({
     onEgress: (e) => {
+      const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
+
+      // The DESTINATION axis is loud in EVERY shell, and deliberately does not
+      // inherit the expectsIpc suppression below. That suppression is correct
+      // for the transport axis — HTTP genuinely is the sanctioned transport in a
+      // browser — but there is no shell in which fetching from a host we do not
+      // own is fine. Scoping this one to the desktop would have hidden all six
+      // public-CDN fetches found in cdn-egress-fixes-2026-08-02 from anyone
+      // running in a browser, which is where most of them were first reachable.
+      if (e.axis === 'foreign-origin') {
+        host?.error?.(
+          `[desktop-ipc] FOREIGN-ORIGIN EGRESS: ${e.url} at ` +
+            `t=${Math.round(e.startMs)}ms. Nothing may be fetched from a host we do not ` +
+            `own — this is almost always a third-party library's baked-in CDN default ` +
+            `(see cdn-egress-fixes-2026-08-02 for the six already fixed, and the local ` +
+            `runtime mirrors under apps/operator/public that replaced them).`,
+        );
+        return;
+      }
+
       // Loudness is scoped to shells that were SUPPOSED to use IPC. In a browser
       // (or under the deliberate forceHttp rollback) HTTP is the sanctioned
       // transport, so an error per request would be noise — but the report is
       // still recorded, so the invariant can always be READ.
       if (!expectsIpc) return;
-      const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;
       host?.error?.(
         `[desktop-ipc] HTTP EGRESS: ${e.path} went over the network stack at ` +
           `t=${Math.round(e.startMs)}ms (${Math.round(e.durationMs)}ms). Inside the desktop ` +

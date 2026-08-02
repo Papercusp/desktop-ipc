@@ -306,3 +306,173 @@ describe('the transports resource timing cannot see', () => {
     expect(blindTo.join(' ')).toMatch(/BEFORE this monitor installed/);
   });
 });
+
+/**
+ * The DESTINATION axis (egress-monitor-origin-axis-2026-08-02 P-001/P-002).
+ *
+ * These are regression tests for a REAL months-long blindness, so the fixtures
+ * are the actual URLs from the 2026-08-02 audit rather than invented hosts. All
+ * six shipped under a live, healthy, correctly-working monitor — it was simply
+ * answering a different question (`/api/*` on OUR origin escaping IPC), and its
+ * two filters discarded every one of them before the rule ever ran.
+ *
+ * Per this file's own standing lesson, every case is asserted under BOTH
+ * document origins: the dev shell discarded them at the same-origin narrowing,
+ * the packaged shell at the `/api/` prefix check. Blind in both, for different
+ * reasons — so a test under one origin alone would prove nothing.
+ */
+describe('foreign-origin axis', () => {
+  /** A sensor proven alive, so a zero can legitimately read `clean`. */
+  const PROVEN: EgressSensorState = {
+    controlObserved: true,
+    resourceTiming: true,
+    transportsWrapped: true,
+    blindTo: [],
+  };
+
+  /** The real offenders, as measured in the built bundle on 2026-08-02. */
+  const VDITOR = 'https://unpkg.com/vditor@3.11.2/dist/js/lute/lute.min.js';
+  const MONACO = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs/loader.js';
+  const MONACO_2 = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.55.1/min/vs/editor/editor.main.css';
+
+  for (const [label, origin] of [
+    ['dev shell', ORIGIN],
+    ['packaged shell', PACKAGED_ORIGIN],
+  ] as const) {
+    it(`catches a public-CDN fetch in the ${label}`, () => {
+      const report = classifyEgress([r(VDITOR, 480)], { documentOrigin: origin }, PROVEN);
+
+      expect(report.foreignOrigin.total).toBe(1);
+      expect(report.foreignOrigin.verdict).toBe('breach');
+      expect(report.foreignOrigin.byOrigin['https://unpkg.com'].count).toBe(1);
+      // ...and it is NOT counted as a transport escape: it is not our API at all.
+      expect(report.total).toBe(0);
+    });
+  }
+
+  it('does not treat loopback as foreign, in either shell', () => {
+    const local = [
+      r('http://localhost:3070/assets/app.js', 10),
+      r('http://127.0.0.1:3270/api/harness/list', 20),
+      r('http://[::1]:3070/assets/x.css', 30),
+    ];
+
+    for (const origin of [ORIGIN, PACKAGED_ORIGIN]) {
+      const report = classifyEgress(local, { documentOrigin: origin }, PROVEN);
+      expect(report.foreignOrigin.total).toBe(0);
+      expect(report.foreignOrigin.verdict).toBe('clean');
+    }
+  });
+
+  it('keeps the two axes independent', () => {
+    // An /api call on OUR origin that escaped IPC is a TRANSPORT bug only.
+    // A CDN fetch is a DESTINATION bug only. One report, two separate counts —
+    // collapsing them would hide which of two very different fixes is needed.
+    const report = classifyEgress(
+      [r(`${ORIGIN}/api/harness/list`, 100), r(MONACO, 200)],
+      { documentOrigin: ORIGIN },
+      PROVEN,
+    );
+
+    expect(report.total).toBe(1);
+    expect(report.entries[0].axis).toBe('ipc-escape');
+    expect(report.entries[0].path).toBe('/api/harness/list');
+
+    expect(report.foreignOrigin.total).toBe(1);
+    expect(report.foreignOrigin.entries[0].axis).toBe('foreign-origin');
+    expect(report.foreignOrigin.entries[0].url).toBe(MONACO);
+  });
+
+  it("classifies a THIRD PARTY's /api path per shell — and the axes CAN overlap", () => {
+    // Pinning REAL behaviour, including an overlap that is easy to misread.
+    //
+    // Dev shell: the same-origin narrowing drops it from the transport axis, so
+    // it is purely a destination finding.
+    const dev = classifyEgress(
+      [r('https://api.example.com/api/v1/thing', 50)],
+      { documentOrigin: ORIGIN },
+      PROVEN,
+    );
+    expect(dev.foreignOrigin.total).toBe(1);
+    expect(dev.total).toBe(0);
+
+    // Packaged shell: there is no http origin to be same-origin WITH, so the
+    // transport axis deliberately filters NOTHING by origin (see the file
+    // header — filtering there is what discarded 100% of real escapes). A
+    // foreign `/api/` path therefore trips BOTH axes.
+    //
+    // This overlap is left AS-IS on purpose. Suppressing the transport hit for
+    // foreign origins would quietly narrow a shipped safety invariant that was
+    // written with explicit reasoning, to fix nothing worse than a double-count
+    // — and the destination entry alongside it already tells the triager it is
+    // someone else's host, not our IPC layer leaking.
+    const packaged = classifyEgress(
+      [r('https://api.example.com/api/v1/thing', 50)],
+      { documentOrigin: PACKAGED_ORIGIN },
+      PROVEN,
+    );
+    expect(packaged.foreignOrigin.total).toBe(1);
+    expect(packaged.total).toBe(1);
+  });
+
+  it('rolls up by ORIGIN so one offender is one row, not fifteen', () => {
+    // Monaco alone pulls a dozen chunks from one host. Rolling up by path the
+    // way the transport axis does would bury a single bug under a wall of rows.
+    const report = classifyEgress(
+      [r(MONACO, 10), r(MONACO_2, 20), r(VDITOR, 30)],
+      { documentOrigin: ORIGIN },
+      PROVEN,
+    );
+
+    expect(Object.keys(report.foreignOrigin.byOrigin).sort()).toEqual([
+      'https://cdn.jsdelivr.net',
+      'https://unpkg.com',
+    ]);
+    expect(report.foreignOrigin.byOrigin['https://cdn.jsdelivr.net'].count).toBe(2);
+    expect(report.foreignOrigin.byOrigin['https://cdn.jsdelivr.net'].firstAtMs).toBe(10);
+  });
+
+  it('honours an explicit allowlist without weakening the rest', () => {
+    const report = classifyEgress(
+      [r('https://declared.example.com/thing.js', 10), r(VDITOR, 20)],
+      { documentOrigin: ORIGIN, allowedOrigins: ['https://declared.example.com'] },
+      PROVEN,
+    );
+
+    expect(report.foreignOrigin.total).toBe(1);
+    expect(report.foreignOrigin.byOrigin['https://unpkg.com']).toBeTruthy();
+  });
+
+  it('reports UNKNOWN, not clean, when the sensor was never proven', () => {
+    // The whole point of the three-valued verdict, carried onto the new axis: a
+    // dead detector and a genuinely clean run both report zero, and reading that
+    // zero as "no CDN fetches" is exactly the false all-clear this axis exists
+    // to prevent.
+    const report = classifyEgress([], { documentOrigin: PACKAGED_ORIGIN });
+
+    expect(report.foreignOrigin.total).toBe(0);
+    expect(report.foreignOrigin.verdict).toBe('unknown');
+  });
+
+  it('never counts the sensor’s own control request', () => {
+    const control = `${ORIGIN}/__egress_control__?${EGRESS_CONTROL_PARAM}=abc123`;
+    const report = classifyEgress([r(control, 5)], { documentOrigin: PACKAGED_ORIGIN }, PROVEN);
+
+    // Under the packaged origin this is a non-local http request and would
+    // otherwise read as foreign — the control exclusion has to apply to BOTH
+    // axes or proving the sensor alive would itself trip the new rule.
+    expect(report.foreignOrigin.total).toBe(0);
+    expect(report.total).toBe(0);
+  });
+
+  it('sees a foreign WebSocket, which resource timing cannot report at all', () => {
+    const report = classifyEgress(
+      [{ name: 'wss://realtime.example.com/socket', startTime: 40, duration: 0, via: 'websocket' }],
+      { documentOrigin: ORIGIN },
+      PROVEN,
+    );
+
+    expect(report.foreignOrigin.total).toBe(1);
+    expect(report.foreignOrigin.entries[0].via).toBe('websocket');
+  });
+});
