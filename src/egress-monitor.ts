@@ -78,8 +78,18 @@
  * app reports `unknown` and is honest about it.
  */
 
-/** How an escape was observed. Resource timing cannot see the last two. */
-export type EgressVia = 'resource-timing' | 'websocket' | 'eventsource';
+/**
+ * How an escape was observed. Resource timing cannot see the last three.
+ *
+ * `csp-violation` is the P-006 cross-check: the browser's own CSP engine
+ * reporting a request that the local-only policy would have blocked. Its blind
+ * spots are DIFFERENT from resource timing's, which is the whole point of having
+ * it — it can see a request refused before it ever reached the network stack
+ * (and therefore produced no timing entry at all), while resource timing sees
+ * requests that no policy covers. Agreement between them is corroboration;
+ * disagreement localizes which sensor is lying.
+ */
+export type EgressVia = 'resource-timing' | 'websocket' | 'eventsource' | 'csp-violation';
 
 /**
  * WHICH INVARIANT an observation violates. Two ORTHOGONAL rules ride the one
@@ -526,11 +536,39 @@ export function installEgressMonitor(opts: EgressOptions = {}): EgressMonitorHan
   ].filter((f): f is () => void => f !== null);
   state.transportsWrapped = restores.length > 0;
 
+  // P-006 second sensor: the browser's own CSP engine. Fires only where a policy
+  // is actually served (the SPA host + the vite dev server set a REPORT-ONLY
+  // local-only policy), so its absence is never read as "clean" — it only ever
+  // ADDS observations, and the verdict still gates on the control request.
+  //
+  // `blockedURI` is NOT always a URL: the spec uses the bare tokens "inline",
+  // "eval" and "data" for non-fetch violations. Those are about how code RUNS,
+  // not where it came from, so they are not egress and are dropped here rather
+  // than left for classifyEgress to resolve into a bogus same-origin entry.
+  const NON_URL_BLOCKED_URIS = new Set(['inline', 'eval', 'data', 'blob', 'about', 'self']);
+  const onCspViolation = (ev: Event): void => {
+    const blocked = (ev as unknown as { blockedURI?: unknown }).blockedURI;
+    if (typeof blocked !== 'string' || blocked === '') return;
+    if (NON_URL_BLOCKED_URIS.has(blocked)) return;
+    recordTransportEgress(blocked, 'csp-violation');
+  };
+  let cspListening = false;
+  try {
+    window.addEventListener('securitypolicyviolation', onCspViolation);
+    cspListening = true;
+  } catch {
+    // A missing addEventListener is a degraded environment, not a crash: the
+    // other sensors stand on their own and blindTo records the gap below.
+  }
+
   state.blindTo = [
     ...(state.resourceTiming ? [] : ['fetch/XHR/img — PerformanceObserver is unavailable here']),
     ...(state.transportsWrapped
       ? ['WebSocket/EventSource streams opened BEFORE this monitor installed']
       : ['WebSocket and EventSource entirely — constructors could not be wrapped']),
+    ...(cspListening
+      ? ['CSP violations only where a policy is SERVED — absence is not evidence of none']
+      : ['CSP violations entirely — securitypolicyviolation could not be listened for']),
   ];
 
   const handle: EgressMonitorHandle = {
@@ -543,6 +581,13 @@ export function installEgressMonitor(opts: EgressOptions = {}): EgressMonitorHan
         // Already disconnected — stop() is idempotent by contract.
       }
       for (const restore of restores) restore();
+      if (cspListening) {
+        try {
+          window.removeEventListener('securitypolicyviolation', onCspViolation);
+        } catch {
+          // Already gone — stop() is idempotent by contract.
+        }
+      }
       if (active === handle) active = null;
     },
   };

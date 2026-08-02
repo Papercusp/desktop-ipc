@@ -476,3 +476,59 @@ describe('foreign-origin axis', () => {
     expect(report.foreignOrigin.entries[0].via).toBe('websocket');
   });
 });
+
+/**
+ * P-006: the CSP engine as a SECOND sensor, with different blind spots from
+ * resource timing. It matters that this is additive — it may only ever ADD
+ * observations, never license a `clean` verdict on its own, because a policy
+ * that is not served produces no violations at all, and that silence is
+ * indistinguishable from a genuinely clean session.
+ */
+describe('the CSP violation sensor (P-006)', () => {
+  afterEach(() => {
+    _resetEgressMonitorForTests();
+    vi.unstubAllGlobals();
+  });
+
+  function violate(blockedURI: unknown): void {
+    const ev = new Event('securitypolicyviolation') as Event & { blockedURI?: unknown };
+    ev.blockedURI = blockedURI;
+    window.dispatchEvent(ev);
+  }
+
+  it('records a foreign blockedURI on the foreign-origin axis', () => {
+    const handle = installEgressMonitor({ documentOrigin: PACKAGED_ORIGIN });
+    violate('https://cdn.jsdelivr.net/npm/evil@1.0.0/dist/e.min.js');
+
+    const report = handle!.report();
+    expect(report.foreignOrigin.total).toBe(1);
+    expect(report.foreignOrigin.entries[0].via).toBe('csp-violation');
+    expect(report.foreignOrigin.byOrigin['https://cdn.jsdelivr.net'].count).toBe(1);
+  });
+
+  it('ignores the non-URL blockedURI tokens — they are not egress', () => {
+    // The spec uses bare "inline"/"eval"/"data" for violations about how code
+    // RUNS. Left unfiltered they resolve against the document origin and would
+    // appear as bogus entries, inflating every report with non-egress noise.
+    const handle = installEgressMonitor({ documentOrigin: PACKAGED_ORIGIN });
+    for (const token of ['inline', 'eval', 'data', 'blob', '']) violate(token);
+    violate(undefined);
+    violate(42);
+
+    expect(handle!.report().foreignOrigin.total).toBe(0);
+  });
+
+  it('stops recording after stop() — the listener is removed, not just ignored', () => {
+    const handle = installEgressMonitor({ documentOrigin: PACKAGED_ORIGIN });
+    handle!.stop();
+    violate('https://cdn.jsdelivr.net/npm/after-stop@1.0.0/x.js');
+
+    expect(handle!.report().foreignOrigin.total).toBe(0);
+  });
+
+  it('declares in blindTo that seeing no violations does NOT mean no egress', () => {
+    // The honest caveat: violations fire only where a policy is actually served.
+    const handle = installEgressMonitor({ documentOrigin: PACKAGED_ORIGIN });
+    expect(handle!.report().sensor.blindTo.join(' | ')).toMatch(/CSP violations only where/);
+  });
+});

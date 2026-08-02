@@ -74,6 +74,15 @@ export {
   type EgressMonitorHandle,
   type ResourceTimingLike,
 } from './egress-monitor';
+// P-006: the destination invariant expressed as a CSP (the PREVENTION leg, vs
+// the monitor above which OBSERVES). One shared constant so the vite dev server,
+// the SPA host and the desktop cannot drift apart on what "local" means.
+export {
+  LOCAL_ONLY_CSP,
+  CSP_REPORT_ONLY_HEADER,
+  CSP_ENFORCING_HEADER,
+  cspReportOnlyHeaders,
+} from './csp-policy';
 export type {
   EndpointStreamEvent,
   DispatchEndpointStreamOptions,
