@@ -82,6 +82,32 @@
 export type EgressVia = 'resource-timing' | 'websocket' | 'eventsource';
 
 /**
+ * WHICH INVARIANT an observation violates. Two ORTHOGONAL rules ride the one
+ * sensor (egress-monitor-origin-axis-2026-08-02 P-001/P-002):
+ *
+ * `ipc-escape`    — an `/api/*` call on OUR origin reached the network stack
+ *                   instead of travelling over IPC (the original transport
+ *                   invariant, no-http-anywhere D-005).
+ * `foreign-origin`— a request went to a host we do not own, whatever its path
+ *                   (the DESTINATION invariant).
+ *
+ * They are reported SEPARATELY and must stay that way. They have different
+ * owners and different fixes: an ipc-escape is a bug in our transport layer, a
+ * foreign-origin is usually a third-party library's baked-in CDN default.
+ * Collapsing them into one number destroys the only signal that makes either
+ * actionable.
+ *
+ * WHY THE SECOND AXIS EXISTS. The original rule filtered to `/api/` paths on the
+ * document origin, so it was STRUCTURALLY blind to the entire public-CDN class:
+ * `https://unpkg.com/vditor@3.11.2/dist/js/lute/lute.min.js` was discarded in the
+ * dev shell for not being our origin, and in the packaged shell for not being an
+ * `/api/` path. Six such fetches (vditor, monaco, plantuml, porcupine, excalidraw,
+ * emoji-mart) shipped for months under a live, healthy, correctly-working monitor
+ * — because it was answering a different question.
+ */
+export type EgressAxis = 'ipc-escape' | 'foreign-origin';
+
+/**
  * `clean` — the sensor was PROVEN live and saw no escape.
  * `breach` — an escape was observed (needs no proof; observation is evidence).
  * `unknown` — no escape seen, but the sensor was never proven live. Callers
@@ -101,6 +127,26 @@ export interface EgressEntry {
   durationMs: number;
   /** Which sensor caught it. */
   via: EgressVia;
+  /** WHICH invariant this violates. See {@link EgressAxis}. */
+  axis: EgressAxis;
+}
+
+/** The foreign-origin axis: requests to hosts we do not own. */
+export interface ForeignOriginReport {
+  /** Honest answer for THIS axis. `unknown` is a failure, exactly as above. */
+  verdict: EgressVerdict;
+  /** Total requests to non-local origins. Zero alone does NOT mean clean. */
+  total: number;
+  /**
+   * Per-ORIGIN rollup — the triage unit that matters here. A CDN offender is one
+   * host serving many paths (monaco alone pulls a dozen chunks), so rolling up by
+   * path the way the ipc axis does would bury one bug under fifteen rows.
+   */
+  byOrigin: Record<string, { count: number; firstAtMs: number; sampleUrl: string }>;
+  /** When the first foreign request happened, or null when there were none. */
+  firstAtMs: number | null;
+  /** The observed entries, oldest first, bounded by EGRESS_RING_SIZE. */
+  entries: EgressEntry[];
 }
 
 export interface EgressSensorState {
@@ -127,7 +173,19 @@ export interface EgressReport {
   entries: EgressEntry[];
   /** Why the verdict is what it is. */
   sensor: EgressSensorState;
+  /**
+   * The DESTINATION axis, reported separately on purpose (P-002). The fields
+   * above remain the transport axis alone, so existing callers keep their exact
+   * meaning rather than silently starting to count a different class of thing.
+   */
+  foreignOrigin: ForeignOriginReport;
 }
+
+/**
+ * Hostnames that are never "foreign" — the loopback family. NOT a policy knob:
+ * these are the addresses that by definition never leave the machine.
+ */
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
 
 /** Bounded so a pathological page cannot grow this without limit. */
 export const EGRESS_RING_SIZE = 200;
@@ -169,6 +227,14 @@ export interface EgressOptions {
   documentOrigin?: string;
   /** Called once per newly observed escape, for a loud failure. */
   onEgress?: (entry: EgressEntry) => void;
+  /**
+   * Non-local origins that are LEGITIMATE for this app, as exact origins
+   * (`https://example.com`). Empty by default and it should stay near-empty: an
+   * entry here is a declared, reviewed hole in the destination invariant.
+   *
+   * Loopback is always allowed and is NOT expressed here — see LOCAL_HOSTNAMES.
+   */
+  allowedOrigins?: readonly string[];
 }
 
 const API_PREFIX = '/api/';
