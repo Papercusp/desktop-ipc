@@ -17,7 +17,7 @@
  *    `{ server }` attachment anywhere, so no socket shares the operator's HTTP
  *    listener. A same-origin `/api` WebSocket is therefore not merely absent, it
  *    is unserved: there is nothing on the other end for a shim to reach.
- *  - **All four client call sites target a different process.** voice x2 and
+ *  - **All four client call sites target a different LISTENER.** voice x2 and
  *    video default to `ws://127.0.0.1:3076/api/desktop/voice` — a separate
  *    sidecar port, under the one prefix D-008 sanctions for the native transport.
  *    PiPanel's PTY socket returns `null` outright in the Tauri shell
@@ -107,8 +107,16 @@ export function classifyWsTarget(url: string | URL, documentOrigin: string): WsV
   // never the same `origin` STRING, so the origin comparison `xhr-guard` uses
   // would pass every same-origin socket straight through. Port-sensitivity is
   // also exactly what separates the operator (:3055) from the voice sidecar
-  // (:3076) and the pty bridge (:3056), which are different processes and must
+  // (:3076) and the pty bridge (:3056), which are different LISTENERS and must
   // keep their native sockets.
+  //
+  // ⚠ "different listener", NOT "different process" — an earlier version of this
+  // comment (and D-042) said process, and that was wrong. Both are started by
+  // plain in-process calls inside the operator host (`startPtyWsServer` at
+  // hono-host.ts:367, `startDesktopVoiceWs` at host-bootstrap.ts:774); PTY in
+  // particular MUST be in-process because the registry its WS attaches to is
+  // in-process state. The stake is which operator INSTANCE serves them
+  // (content-origin vs IPC-owner), which is what D-044 settles.
   if (u.host !== doc.host) return { kind: 'pass' };
   if (!u.pathname.startsWith(API_PREFIX)) return { kind: 'pass' };
 

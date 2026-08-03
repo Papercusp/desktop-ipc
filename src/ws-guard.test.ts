@@ -37,10 +37,11 @@ describe('classifyWsTarget', () => {
     expect(classifyWsTarget('ws://localhost:3055/api/x', ORIGIN).kind).toBe('violation');
   });
 
-  it('PASSES the voice/video sidecar on :3076 — a different process, and D-008-sanctioned', () => {
+  it('PASSES the voice/video sidecar on :3076 — a different listener, and D-008-sanctioned', () => {
     // The measured real default for all three voice/video clients. Two
-    // independent reasons it must pass: a different port is a different process,
-    // and the path is content-origin scoped.
+    // independent reasons it must pass: a different port is a different
+    // LISTENER (in the same operator host process — see the note in ws-guard.ts;
+    // saying "process" here was wrong), and the path is content-origin scoped.
     expect(classifyWsTarget('ws://127.0.0.1:3076/api/desktop/voice', ORIGIN)).toEqual({
       kind: 'pass',
     });
