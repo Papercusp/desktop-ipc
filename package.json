@@ -14,9 +14,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@papercusp/tooldef": "*",
-    "@papercusp/sse": "*",
     "@tauri-apps/api": "*"
+  },
+  "peerDependencies": {
+    "@papercusp/tooldef": "*",
+    "@papercusp/sse": "*"
   },
   "devDependencies": {
     "jsdom": "*",

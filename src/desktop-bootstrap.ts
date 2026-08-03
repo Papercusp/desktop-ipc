@@ -272,14 +272,47 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
       throw err;
     });
 
+  /**
+   * Convert a Request into the `(url, init)` pair {@link ipcFetch} takes.
+   *
+   * WI-6618 (plan no-http-anywhere-2026-07-28 P-009). `ipcFetch` rejects a
+   * non-string body outright, so the body is read via `.text()` — which buffers
+   * a stream body too, closing the "especially with a streaming body" gap that
+   * kept the Request form on HTTP. The Request is CLONED first so a caller
+   * holding its own reference can still read the body afterwards.
+   *
+   * `mode` is deliberately NOT copied: a navigated Request reports
+   * `mode: 'navigate'`, which is invalid in a RequestInit and would throw. It
+   * carries no meaning over IPC, where there is no CORS to negotiate.
+   */
+  const initFromRequest = async (req: Request): Promise<RequestInit> => {
+    const headers: Record<string, string> = {};
+    req.headers.forEach((v, k) => {
+      headers[k] = v;
+    });
+    const init: RequestInit = {
+      method: req.method,
+      headers,
+      credentials: req.credentials,
+      cache: req.cache,
+      redirect: req.redirect,
+      integrity: req.integrity,
+      referrer: req.referrer,
+      signal: req.signal,
+    };
+    // GET/HEAD cannot carry one, and `.text()` on a bodyless Request is just ''.
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      init.body = await req.clone().text();
+    }
+    return init;
+  };
+
   // Patch fetch: same-origin /api/* → ipcFetch; everything else native.
-  // Reject the Request-form input by falling through to native — Phase 1
-  // ipcFetch wants a URL + init, and converting a Request faithfully
-  // (especially with a streaming body) is more code than it's worth
-  // until a real consumer needs it.
-  const patchedFetch: typeof window.fetch = (input, init) => {
-    if (typeof input === 'string' || input instanceof URL) {
-      // ipc-cors-2026-06-24: Tauri's IPC init script tries the `ipc://localhost/<cmd>`
+  // Returns null when this input is not ours to route (the caller then goes
+  // native), so the Request form below can reuse the EXACT same rules rather
+  // than growing a second copy that drifts.
+  const routeUrlForm = (input: string | URL, init?: RequestInit): Promise<Response> | null => {
+    // ipc-cors-2026-06-24: Tauri's IPC init script tries the `ipc://localhost/<cmd>`
       // custom-protocol fetch FIRST on non-Android. On Linux/WebKitGTK, when the frontend is
       // served from a REMOTE origin (Papercusp loads the operator over http://127.0.0.1:<port>,
       // not the bundled tauri:// asset protocol), wry registers custom schemes secure-only — never
@@ -321,7 +354,38 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
         // fall back to a direct HTTP fetch. ipcFetch only accepts
         // string bodies, so `init` is always safe to replay.
         return ipcFetchWithFallback(input, init);
+    }
+    return null;
+  };
+
+  const patchedFetch: typeof window.fetch = (input, init) => {
+    if (typeof input === 'string' || input instanceof URL) {
+      return routeUrlForm(input, init) ?? originalFetchBound(input as RequestInfo, init);
+    }
+    // WI-6618 (P-009): the Request form used to fall straight through to the
+    // native transport here, which is SILENT HTTP EGRESS from the webview —
+    // exactly what D-005 forbids ("HTTP is a loud failure, never a fallback").
+    // It is invisible precisely because it works: the request succeeds, just
+    // over the transport the plan exists to eliminate.
+    if (typeof Request !== 'undefined' && input instanceof Request) {
+      // Let the PLATFORM do the spec-correct (request, init) merge — init
+      // overrides the Request's own fields — instead of hand-merging two
+      // shapes and getting the precedence subtly wrong.
+      let merged: Request;
+      try {
+        merged = new Request(input, init);
+      } catch {
+        return originalFetchBound(input as RequestInfo, init);
       }
+      if (!isSameOriginApiPath(merged.url)) {
+        return originalFetchBound(input as RequestInfo, init);
+      }
+      return initFromRequest(merged).then((converted) => {
+        const routed = routeUrlForm(merged.url, converted);
+        // isSameOriginApiPath already matched, so routeUrlForm routes it; the
+        // fallback is only for the ipc:// / non-/api shapes it can still decline.
+        return routed ?? originalFetchBound(input as RequestInfo, init);
+      });
     }
     return originalFetchBound(input as RequestInfo, init);
   };
