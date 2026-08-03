@@ -37,6 +37,7 @@ import { installEgressMonitor, _resetEgressMonitorForTests } from './egress-moni
 import { isIpcNotWired, isIpcUnavailable } from './ipc-availability';
 import { IpcEventSource, setNativeEventSourceFallback, _resetIpcEventSourceFallback } from './ipc-event-source';
 import { ipcFetch } from './ipc-fetch';
+import { installXhrGuard, _resetXhrGuardForTests } from './xhr-guard';
 
 interface InstallHandle {
   uninstall: () => void;
@@ -433,10 +434,21 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   (window as unknown as { EventSource: typeof window.EventSource }).EventSource =
     IpcEventSource as unknown as typeof window.EventSource;
 
+  // P-010: the THIRD transport door. fetch and EventSource are routed above;
+  // XMLHttpRequest has no IPC route at all, so the guard refuses a same-origin
+  // /api call rather than letting it reach the network stack unannounced. It
+  // installs INSIDE the expectsIpc block on purpose — in a browser, or under the
+  // forceHttp rollback, HTTP is the sanctioned transport and there is nothing to
+  // police. See xhr-guard.ts for what was measured before it was written.
+  const xhrGuard = installXhrGuard();
+
   installed = true;
 
   return {
     uninstall: () => {
+      // FIRST, by the same LIFO rule the egress note below states: this wrapper
+      // was installed last, so it unwinds first.
+      xhrGuard?.uninstall();
       window.fetch = originalFetchRef;
       if (consoleHost && originalWarn && consoleHost.warn === filteredWarn) {
         consoleHost.warn = originalWarn as typeof console.warn;
@@ -474,4 +486,8 @@ export function _resetForTests(): void {
   _resetContentOriginCacheForTests();
   _resetIpcEventSourceFallback();
   _resetEgressMonitorForTests();
+  // Same reason as the egress reset above: the guard holds module-level state
+  // (the installed handle and the reported-path set), so a partial reset leaves
+  // the next test running against the previous test's globals.
+  _resetXhrGuardForTests();
 }

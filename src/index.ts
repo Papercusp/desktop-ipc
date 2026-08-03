@@ -74,6 +74,17 @@ export {
   type EgressMonitorHandle,
   type ResourceTimingLike,
 } from './egress-monitor';
+// P-010: the third transport door. fetch and EventSource are ROUTED over IPC;
+// XMLHttpRequest has no IPC route, so it is REFUSED instead. `classifyXhrTarget`
+// is the pure rule, testable without a DOM — same split as `classifyEgress`.
+export {
+  installXhrGuard,
+  classifyXhrTarget,
+  _resetXhrGuardForTests,
+  type XhrVerdict,
+  type XhrGuardOptions,
+  type XhrGuardHandle,
+} from './xhr-guard';
 // P-006: the destination invariant expressed as a CSP (the PREVENTION leg, vs
 // the monitor above which OBSERVES). One shared constant so the vite dev server,
 // the SPA host and the desktop cannot drift apart on what "local" means.
