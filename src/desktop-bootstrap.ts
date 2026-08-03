@@ -368,17 +368,32 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
     // It is invisible precisely because it works: the request succeeds, just
     // over the transport the plan exists to eliminate.
     if (typeof Request !== 'undefined' && input instanceof Request) {
+      // Decide OURS-vs-NOT from the Request's own url first, before any
+      // conversion can fail — otherwise a conversion failure is indistinguishable
+      // from "not ours" and silently becomes HTTP, which is the very bug.
+      const rawUrl = typeof input.url === 'string' ? input.url : '';
+      if (!rawUrl || !isSameOriginApiPath(rawUrl)) {
+        return originalFetchBound(input as RequestInfo, init);
+      }
       // Let the PLATFORM do the spec-correct (request, init) merge — init
       // overrides the Request's own fields — instead of hand-merging two
       // shapes and getting the precedence subtly wrong.
       let merged: Request;
       try {
         merged = new Request(input, init);
-      } catch {
-        return originalFetchBound(input as RequestInfo, init);
-      }
-      if (!isSameOriginApiPath(merged.url)) {
-        return originalFetchBound(input as RequestInfo, init);
+      } catch (err) {
+        // D-005: this IS a same-origin /api call, so it may not quietly revert
+        // to the transport this plan exists to eliminate. A Request we cannot
+        // re-read (a already-consumed body being the realistic case) is a caller
+        // bug — surface it loudly rather than hiding it behind working HTTP.
+        return Promise.reject(
+          new Error(
+            `desktop-ipc: cannot route the Request-form fetch for ${rawUrl} over IPC ` +
+              `(the Request could not be cloned — an already-consumed body?), and the ` +
+              `HTTP fallback is disabled for same-origin /api calls (D-005). ` +
+              `Underlying: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
       }
       return initFromRequest(merged).then((converted) => {
         const routed = routeUrlForm(merged.url, converted);

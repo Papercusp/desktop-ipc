@@ -345,18 +345,72 @@ describe('installDesktopIpcPolyfills', () => {
     });
   });
 
-  it('passes Request-form inputs straight to native fetch (Phase 1 limitation)', async () => {
-    const win = (globalThis as { window?: TestWindow }).window!;
-    const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
-    installDesktopIpcPolyfills();
+  /**
+   * WI-6618 (plan no-http-anywhere-2026-07-28, P-009).
+   *
+   * The Request form used to fall straight through to native fetch — a
+   * documented "Phase 1 limitation" whose real-world meaning was SILENT HTTP
+   * EGRESS from the webview, the exact thing D-005 forbids. It was invisible
+   * because it worked: the request succeeded, just over the transport the plan
+   * exists to eliminate.
+   *
+   * The old test for this asserted the limitation using a prototype-hacked
+   * plain object (`Object.setPrototypeOf({...}, Request.prototype)`). That fake
+   * is not constructible by `new Request(...)`, so it passed for a reason
+   * unrelated to the rule it claimed to check — it exercised the conversion's
+   * FAILURE path, not the Request path. These use real Requests.
+   */
+  describe('Request-form inputs (WI-6618 / P-009)', () => {
+    it('routes a same-origin /api Request over IPC, NOT native', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      installDesktopIpcPolyfills();
 
-    // Request-form goes native even for same-origin /api/* — documented
-    // limitation. (We avoid the complexity of converting a Request to
-    // string + init faithfully.)
-    const reqLike = { url: 'http://localhost:3055/api/x', method: 'POST' };
-    Object.setPrototypeOf(reqLike, Request.prototype);
-    await win.fetch!(reqLike as unknown as Request);
-    expect(fakeFetch).toHaveBeenCalledTimes(1);
+      // Same shape as the string-form test above: ipcFetch throws (no real
+      // Tauri to invoke through), and the point is that native was not used.
+      let routedThroughIpc = false;
+      try {
+        await win.fetch!(new Request('http://localhost:3055/api/x', { method: 'POST', body: '{"a":1}' }));
+      } catch {
+        routedThroughIpc = true;
+      }
+      expect(routedThroughIpc).toBe(true);
+      expect(fakeFetch).not.toHaveBeenCalled();
+    });
+
+    it('leaves a same-origin NON-/api Request on native', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      installDesktopIpcPolyfills();
+
+      await win.fetch!(new Request('http://localhost:3055/_next/static/chunk.js'));
+      expect(fakeFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves a cross-origin Request on native', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      installDesktopIpcPolyfills();
+
+      await win.fetch!(new Request('https://api.posthog.com/track', { method: 'POST', body: 'x' }));
+      expect(fakeFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('FAILS LOUD rather than silently using HTTP when a same-origin /api Request cannot be converted (D-005)', async () => {
+      const win = (globalThis as { window?: TestWindow }).window!;
+      const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+      installDesktopIpcPolyfills();
+
+      // A Request whose body has already been consumed cannot be re-read, so
+      // `new Request(input, init)` throws. The failure direction is the whole
+      // point: quietly reverting to HTTP here would reintroduce the bug while
+      // looking perfectly healthy.
+      const consumed = new Request('http://localhost:3055/api/x', { method: 'POST', body: 'once' });
+      await consumed.text();
+
+      await expect(win.fetch!(consumed)).rejects.toThrow(/HTTP fallback is disabled|could not be cloned/);
+      expect(fakeFetch).not.toHaveBeenCalled();
+    });
   });
 });
 
