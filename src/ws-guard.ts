@@ -20,9 +20,16 @@
  *  - **All four client call sites target a different LISTENER.** voice x2 and
  *    video default to `ws://127.0.0.1:3076/api/desktop/voice` — a separate
  *    sidecar port, under the one prefix D-008 sanctions for the native transport.
- *    PiPanel's PTY socket returns `null` outright in the Tauri shell
- *    (`__PAPERCUSP_TAURI__.kind === 'native'`), and otherwise refuses to connect
- *    unless the document is on `:3055`. None of them addresses the IPC channel.
+ *    PiPanel's PTY *socket* resolves to `null` in the Tauri shell, so it never
+ *    opens one: the panel takes the native path (`isTauriNative()` →
+ *    openNativeSession → Tauri IPC → pty.rs) instead. ⚠ Say "socket", not
+ *    "PiPanel returns null" — dropping that word is how this sentence was
+ *    misread into WI-7546 ("PTY is disabled in the desktop"), which is refuted.
+ *    Note the operative null is the `:3055` port check, NOT the
+ *    `__PAPERCUSP_TAURI__.kind === 'native'` branch this comment used to cite:
+ *    measured live 2026-08-03, that global was absent in the desktop webview
+ *    while `isTauriNative()` was still true. None of them addresses the IPC
+ *    channel either way.
  *  - **Those consumers are P-014's, not P-013's** — that item is literally "PTY
  *    (terminals) and voice onto the shim". By the plan's own decomposition the
  *    shim has no consumers until P-014 runs.
