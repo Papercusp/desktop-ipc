@@ -38,6 +38,7 @@ import { isIpcNotWired, isIpcUnavailable } from './ipc-availability';
 import { IpcEventSource, setNativeEventSourceFallback, _resetIpcEventSourceFallback } from './ipc-event-source';
 import { ipcFetch } from './ipc-fetch';
 import { installXhrGuard, _resetXhrGuardForTests } from './xhr-guard';
+import { installWsGuard, _resetWsGuardForTests } from './ws-guard';
 
 interface InstallHandle {
   uninstall: () => void;
@@ -261,7 +262,9 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
           host?.error?.(
             `[desktop-ipc] IPC bridge unavailable for ${String(input)} — refusing the ` +
               `HTTP fallback (requireIpc). Check that the operator's endpoint-ipc socket ` +
-              `exists AND has connections; set DESKTOP_IPC_FORCE_HTTP=1 to roll back.`,
+              `exists AND has connections. To roll back: set DESKTOP_IPC_FORCE_HTTP=1 before ` +
+              `launch, or from inside a running app (env vars are compiled out of a browser ` +
+              `bundle) run globalThis.__DESKTOP_IPC_ENV__={DESKTOP_IPC_FORCE_HTTP:'1'} and reload.`,
           );
           throw new Error(
             `desktop-ipc: IPC bridge unavailable and HTTP fallback is disabled (requireIpc). ` +
@@ -442,12 +445,25 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   // police. See xhr-guard.ts for what was measured before it was written.
   const xhrGuard = installXhrGuard();
 
+  // P-013: the FOURTH and last transport door. The egress monitor already wraps
+  // `WebSocket`, but only to RECORD, and a recorder cannot refuse anything. This
+  // wraps ON TOP of that wrapper, which is what makes the two compose correctly:
+  // a refused socket throws before the recorder is reached (so a blocked call is
+  // never counted as egress — D-040(c)), while an allowed one falls through and
+  // is counted exactly once. Measured first, per D-042: the operator serves NO
+  // WebSocket endpoint at all and every real socket lives on its own sidecar
+  // port, so this is a ratchet on a door nobody uses yet — deliberately, not by
+  // default. See ws-guard.ts.
+  const wsGuard = installWsGuard();
+
   installed = true;
 
   return {
     uninstall: () => {
-      // FIRST, by the same LIFO rule the egress note below states: this wrapper
-      // was installed last, so it unwinds first.
+      // FIRST, by the same LIFO rule the egress note below states: these wrappers
+      // were installed last, so they unwind first — and in reverse install order
+      // between themselves.
+      wsGuard?.uninstall();
       xhrGuard?.uninstall();
       window.fetch = originalFetchRef;
       if (consoleHost && originalWarn && consoleHost.warn === filteredWarn) {
@@ -490,4 +506,5 @@ export function _resetForTests(): void {
   // (the installed handle and the reported-path set), so a partial reset leaves
   // the next test running against the previous test's globals.
   _resetXhrGuardForTests();
+  _resetWsGuardForTests();
 }

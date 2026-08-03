@@ -176,8 +176,10 @@ export function installXhrGuard(opts: XhrGuardOptions = {}): XhrGuardHandle {
           `desktop-ipc: XMLHttpRequest to ${verdict.path} is refused — inside the desktop ` +
             `shell every /api call must travel over IPC, and XHR has no IPC route (only ` +
             `fetch and EventSource are patched). Use fetch(), which is routed for you. ` +
-            `Set DESKTOP_IPC_FORCE_HTTP=1 (or configureDesktopIpc({ requireIpc: false })) ` +
-            `to roll the whole no-HTTP policy back.`,
+            `To roll the whole no-HTTP policy back: set DESKTOP_IPC_FORCE_HTTP=1 before launch, ` +
+            `or from inside a running app (env vars are compiled out of a browser bundle) run ` +
+            `globalThis.__DESKTOP_IPC_ENV__={DESKTOP_IPC_FORCE_HTTP:'1'} and reload — ` +
+            `or configureDesktopIpc({ requireIpc: false }).`,
         );
       }
       if (!reported.has(verdict.path)) {

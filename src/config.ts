@@ -13,8 +13,15 @@
  *   });
  *
  * When left unconfigured, it falls back to the generic, unbranded
- * `DESKTOP_IPC_FORCE_HTTP` (or `NEXT_PUBLIC_DESKTOP_IPC_FORCE_HTTP`) env
- * var, so a no-wiring escape hatch still exists for plain consumers.
+ * `DESKTOP_IPC_FORCE_HTTP` (or `NEXT_PUBLIC_DESKTOP_IPC_FORCE_HTTP`) lever, so
+ * a no-wiring escape hatch still exists for plain consumers.
+ *
+ * That lever is read from `globalThis.__DESKTOP_IPC_ENV__` FIRST and
+ * `process.env` second — see {@link readEnvLever}. In a browser bundle only the
+ * first works: `process.env` is substituted by the bundler at build time, so a
+ * `process.env`-only hatch is silently inert in the shipped app, which is
+ * exactly how this one was dead for the whole no-HTTP rollout
+ * (EI-19420043903144442).
  */
 export interface DesktopIpcConfig {
   /**
@@ -241,6 +248,65 @@ export function _resetContentOriginCacheForTests(): void {
 }
 
 /**
+ * Runtime lever bag — the no-wiring escape hatch that survives a bundler.
+ *
+ * Set it from a host bootstrap, or by hand in devtools on an already-shipped
+ * build:
+ *
+ *   globalThis.__DESKTOP_IPC_ENV__ = { DESKTOP_IPC_FORCE_HTTP: '1' };
+ */
+export interface DesktopIpcEnvOverrides {
+  DESKTOP_IPC_FORCE_HTTP?: string;
+  DESKTOP_IPC_REQUIRE?: string;
+  [key: string]: string | undefined;
+}
+
+/**
+ * Read a generic lever, runtime bag first, `process.env` second.
+ *
+ * ⚠ `process.env` ALONE is not a working source in a browser build, and the
+ * reason is the BUNDLER, not the runtime. Vite (and esbuild's `define`)
+ * substitute the *text* `process.env` at build time: in the shipped operator
+ * SPA every read compiles to the literal `{}`, so `{}.DESKTOP_IPC_FORCE_HTTP`
+ * is `undefined` forever and no value set anywhere can reach it. Worse, the
+ * `typeof process !== 'undefined'` guard this function used to sit behind still
+ * PASSES (a `process` shim is installed for other reasons), so the branch was
+ * entered and then silently returned the default — a no-op with no error.
+ *
+ * Measured 2026-08-03 against the live bundle (EI-19420043903144442):
+ *
+ *   $ grep -o '{}\.[A-Z_]\{4,\}' apps/operator-vite/dist/assets/configure-*.js
+ *   {}.DESKTOP_IPC_FORCE_HTTP
+ *   {}.DESKTOP_IPC_REQUIRE
+ *
+ * That mattered because `DESKTOP_IPC_FORCE_HTTP` is the documented ROLLBACK
+ * lever for the whole no-HTTP transport policy — it is named in the error text
+ * `ipcFetch` throws at users ("set DESKTOP_IPC_FORCE_HTTP=1 to roll back"), and
+ * following that instruction inside the desktop app did nothing at all.
+ *
+ * `globalThis` is the fix precisely because no bundler rewrites a property read
+ * off it, so this hatch needs neither a rebuild nor a Node process.
+ */
+function readEnvLever(...names: readonly string[]): string | undefined {
+  const bag = (globalThis as { __DESKTOP_IPC_ENV__?: DesktopIpcEnvOverrides }).__DESKTOP_IPC_ENV__;
+  if (bag) {
+    for (const name of names) {
+      const v = bag[name];
+      if (v !== undefined) return v;
+    }
+  }
+  // Node-side consumers (the transport picker also runs server-side) and tests,
+  // where `process.env` is real rather than a build-time literal.
+  if (typeof process !== 'undefined') {
+    for (const name of names) {
+      const v = process.env?.[name];
+      if (v !== undefined) return v;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Resolve the IPC-stream fallback cooldown. Host config first; a non-finite or
  * negative value falls back to the default rather than disabling the re-probe.
  * `0` is honored (re-probe on every construction) — useful in tests.
@@ -280,11 +346,9 @@ export function isRequireIpc(): boolean {
   if (isForceHttp()) return false;
   const r = cfg.requireIpc;
   if (r !== undefined) return typeof r === 'function' ? Boolean(r()) : Boolean(r);
-  if (typeof process !== 'undefined') {
-    const v = process.env?.DESKTOP_IPC_REQUIRE ?? process.env?.NEXT_PUBLIC_DESKTOP_IPC_REQUIRE;
-    if (v === '1' || v === 'true') return true;
-    if (v === '0' || v === 'false') return false;
-  }
+  const v = readEnvLever('DESKTOP_IPC_REQUIRE', 'NEXT_PUBLIC_DESKTOP_IPC_REQUIRE');
+  if (v === '1' || v === 'true') return true;
+  if (v === '0' || v === 'false') return false;
   return DEFAULT_REQUIRE_IPC;
 }
 
@@ -292,9 +356,6 @@ export function isRequireIpc(): boolean {
 export function isForceHttp(): boolean {
   const f = cfg.forceHttp;
   if (f !== undefined) return typeof f === 'function' ? Boolean(f()) : Boolean(f);
-  if (typeof process !== 'undefined') {
-    const v = process.env?.DESKTOP_IPC_FORCE_HTTP ?? process.env?.NEXT_PUBLIC_DESKTOP_IPC_FORCE_HTTP;
-    return v === '1' || v === 'true';
-  }
-  return false;
+  const v = readEnvLever('DESKTOP_IPC_FORCE_HTTP', 'NEXT_PUBLIC_DESKTOP_IPC_FORCE_HTTP');
+  return v === '1' || v === 'true';
 }

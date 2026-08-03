@@ -51,6 +51,7 @@ export { dispatchEndpointStreamHttp, dispatchEndpointStreamIpc };
 export {
   configureDesktopIpc,
   type DesktopIpcConfig,
+  type DesktopIpcEnvOverrides,
   DEFAULT_CONTENT_ORIGIN_API_PREFIXES,
   isContentOriginScopedPath,
   resolveIpcOwnerIsContentOrigin,
@@ -85,6 +86,19 @@ export {
   type XhrGuardOptions,
   type XhrGuardHandle,
 } from './xhr-guard';
+// P-013: the fourth and last transport door. Like XHR it is REFUSED rather than
+// routed — and for a stronger reason, measured in D-042: the operator serves no
+// WebSocket endpoint at all, so there is nothing to route to. `classifyWsTarget`
+// matches on AUTHORITY (host:port), not the origin string, because `ws://h:p` and
+// `http://h:p` are the same operator but never the same origin.
+export {
+  installWsGuard,
+  classifyWsTarget,
+  _resetWsGuardForTests,
+  type WsVerdict,
+  type WsGuardOptions,
+  type WsGuardHandle,
+} from './ws-guard';
 // P-006: the destination invariant expressed as a CSP (the PREVENTION leg, vs
 // the monitor above which OBSERVES). One shared constant so the vite dev server,
 // the SPA host and the desktop cannot drift apart on what "local" means.
