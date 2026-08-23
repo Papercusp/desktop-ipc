@@ -97,6 +97,29 @@ function isTauri(): boolean {
   );
 }
 
+/**
+ * The thin GUI's connection gate deliberately hard-navigates the main webview
+ * to a credential-free HTTPS Server origin. Tauri still injects
+ * `__TAURI_INTERNALS__` into that document, but its ACL does not grant the
+ * local `endpoint_*` commands there. More importantly, D-003 makes that remote
+ * document a normal browser client: its same-origin fetch/EventSource traffic
+ * must use HTTP/SSE against the Server that served it, not the local shell's
+ * endpoint-IPC bridge.
+ *
+ * Read the current document on every install attempt. The page load creates a
+ * fresh JS world, so this is also the navigation-generation boundary; no extra
+ * mutable flag can drift from what the webview actually committed.
+ */
+function isRemoteServerDocument(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const current = new URL(window.location.href || window.location.origin);
+    return current.protocol === 'https:' && !current.username && !current.password;
+  } catch {
+    return false;
+  }
+}
+
 function isSameOriginApiPath(url: string | URL): boolean {
   if (typeof window === 'undefined') return false;
   try {
@@ -190,7 +213,7 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   // catches the known t=480-783ms offenders), so moving the install EARLIER only
   // widens what it can see; it can never narrow it. `installEgressMonitor` is
   // idempotent (`if (active) return active`), so the re-entry paths below are safe.
-  const expectsIpc = isTauri() && !isForceHttp();
+  const expectsIpc = isTauri() && !isRemoteServerDocument() && !isForceHttp();
   const egress = installEgressMonitor({
     onEgress: (e) => {
       const host = typeof globalThis !== 'undefined' ? globalThis.console : undefined;

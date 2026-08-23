@@ -24,7 +24,7 @@ describe('isIpcUnavailable — IPC-down detection that gates the native-HTTP fal
 
 interface TestWindow {
   __TAURI_INTERNALS__?: { invoke?: () => void };
-  location?: { origin: string };
+  location?: { origin: string; href?: string };
   fetch?: typeof fetch;
   EventSource?: typeof EventSource;
   console?: Console;
@@ -88,6 +88,39 @@ describe('installDesktopIpcPolyfills', () => {
       if (prev === undefined) delete process.env.DESKTOP_IPC_FORCE_HTTP;
       else process.env.DESKTOP_IPC_FORCE_HTTP = prev;
     }
+  });
+
+  it('keeps a remote HTTPS Server document on browser HTTP/SSE even when Tauri internals are injected', async () => {
+    const win = (globalThis as { window?: TestWindow }).window!;
+    win.location = {
+      origin: 'https://localhost:19443',
+      href: 'https://localhost:19443/harness?ws=papercusp-workspace',
+    };
+    const originalFetch = win.fetch;
+    const fakeFetch = win.fetch as ReturnType<typeof vi.fn>;
+
+    expect(installDesktopIpcPolyfills()).toBeNull();
+    expect(win.fetch).toBe(originalFetch);
+    // The passive egress monitor may wrap the native constructor in every
+    // shell. What matters is that the remote document did not install the IPC
+    // transport itself.
+    expect(win.EventSource).not.toBe(IpcEventSource);
+
+    const response = await win.fetch!('/api/pots');
+    expect(await response.text()).toBe('native');
+    expect(fakeFetch).toHaveBeenCalledWith('/api/pots');
+  });
+
+  it('does not treat a credentialed HTTPS URL as an allowed remote Server document', () => {
+    const win = (globalThis as { window?: TestWindow }).window!;
+    win.location = {
+      origin: 'https://server.example.com',
+      href: 'https://user:secret@server.example.com/',
+    };
+
+    const handle = installDesktopIpcPolyfills();
+    expect(handle).not.toBeNull();
+    handle!.uninstall();
   });
 
   it('is idempotent — second call returns null and does not double-patch', () => {
