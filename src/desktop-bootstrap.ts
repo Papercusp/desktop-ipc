@@ -184,9 +184,11 @@ function isContentOriginScopedApiPath(url: string | URL): boolean {
  *    `PAPERCUSP_IPC_READY` handshake (up to 30s), the client isn't
  *    connected yet.
  *
- * In both cases the right move is exactly what main.rs's handshake
- * comment says: fall back to HTTP. `upstream_error` / `aborted` / etc.
- * mean IPC *did* run, so those are real and must NOT be retried.
+ * Under `requireIpc`, `ipcFetch` keeps the narrow, proven-pre-dispatch form
+ * pending and retries until the caller aborts or the reconnecting handle finds
+ * the new advertisement. Legacy/rollback mode falls back to HTTP. Ambiguous
+ * write failures and `upstream_error` / `aborted` mean IPC may have run, so
+ * those remain real failures and must NOT be replayed.
  */
 export { isIpcUnavailable, isIpcNotWired, isIpcNotReady } from './ipc-availability';
 
@@ -261,8 +263,9 @@ export function installDesktopIpcPolyfills(): InstallHandle | null {
   const OriginalEventSource = window.EventSource;
 
   /**
-   * Route one same-origin /api request over IPC, falling back to the native
-   * transport only when the bridge itself is unavailable.
+   * Route one same-origin /api request over IPC. The core retries a proven
+   * pre-dispatch restart window under `requireIpc`; this wrapper reaches the
+   * native transport only under the explicit legacy/rollback policy.
    *
    * Shared by both /api branches so the requireIpc rules cannot drift apart
    * between them — a content-origin-scoped call that reaches IPC must fail as

@@ -41,6 +41,8 @@
  */
 
 import { dispatchEndpointStreamIpc } from './ipc-stream';
+import { getIpcStartupRetryMs, isRequireIpc } from './config';
+import { isIpcRetryableBeforeDispatch } from './ipc-availability';
 import type { DispatchEndpointStreamFn, EndpointStreamEvent } from './types';
 
 export interface IpcFetchRetryOptions {
@@ -53,6 +55,16 @@ export interface IpcFetchRetryOptions {
   backoffMs?: number[];
   /** Injectable delay (tests pass a no-op). Honors the caller's signal. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /**
+   * Retry a proven PRE-DISPATCH `invoke_failed` until the caller aborts.
+   * Defaults to the host's `requireIpc` policy. Safe for every HTTP method:
+   * the classifier admits only failures that occurred before a request frame
+   * could cross the endpoint-IPC boundary. A bare/ambiguous `invoke_failed`
+   * is never replayed.
+   */
+  retryNotReadyUntilAbort?: boolean;
+  /** Retry cadence for {@link retryNotReadyUntilAbort}. */
+  notReadyRetryMs?: number;
 }
 
 export interface IpcFetchOptions {
@@ -220,24 +232,35 @@ export async function ipcFetch(
   // whole batch of concurrent reads (e.g. the /adv Plans tab "loading a lot
   // of things") with a hard error only a manual refresh clears.
   //
-  // Three guards keep the replay safe:
+  // Three guards keep the `connection_lost` replay safe:
   //  - Idempotent methods only (GET/HEAD). A mutation may have been applied
   //    server-side before the drop, so it's never silently replayed — the
   //    error surfaces and the user retries deliberately.
   //  - Pre-head only. Once `head` resolves the Response, bytes may already
   //    be in the consumer's hands; a mid-body drop errors the stream
   //    (makeBodyStream) — it can't be transparently re-run.
-  //  - `connection_lost` only (not `invoke_failed`). `invoke_failed` means
-  //    the IPC backend is absent (dev no-sidecar / prod pre-handshake) and
-  //    is handled by the patched-fetch HTTP fallback — retrying it here
-  //    would make dev mode eat a backoff on every /api call.
+  //  - `connection_lost` only. A separate branch below handles ONLY the
+  //    narrower, proven-pre-dispatch subset of `invoke_failed`: under
+  //    `requireIpc`, a missing/stale advertisement or failed socket connect
+  //    is retried until the caller aborts. That branch is safe for POST too,
+  //    because no request frame crossed the IPC boundary.
   const method = (init.method ?? 'GET').toUpperCase();
   const idempotent = method === 'GET' || method === 'HEAD';
   const backoffMs = opts.retry?.backoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
   const maxRetries = idempotent ? opts.retry?.attempts ?? backoffMs.length : 0;
   const sleep = opts.retry?.sleep ?? defaultSleep;
+  const retryNotReadyUntilAbort =
+    opts.retry?.retryNotReadyUntilAbort ?? isRequireIpc();
+  const configuredNotReadyRetryMs = opts.retry?.notReadyRetryMs;
+  const notReadyRetryMs =
+    typeof configuredNotReadyRetryMs === 'number' &&
+    Number.isFinite(configuredNotReadyRetryMs) &&
+    configuredNotReadyRetryMs >= 0
+      ? configuredNotReadyRetryMs
+      : getIpcStartupRetryMs();
+  let connectionLostRetries = 0;
 
-  for (let attempt = 0; ; attempt++) {
+  for (;;) {
     const iterator = dispatch('sys:http', ipcInput, { signal: abort.signal })[
       Symbol.asyncIterator
     ]();
@@ -282,20 +305,35 @@ export async function ipcFetch(
         throw new TypeError('ipcFetch: stream ended without a head event');
       }
       if (ev.kind === 'error') {
-        if (ev.code === RETRYABLE_ERROR_CODE && attempt < maxRetries) {
-          break; // → backoff + re-dispatch on the reconnected socket
+        let retryDelayMs: number | null = null;
+        if (
+          ev.code === RETRYABLE_ERROR_CODE &&
+          connectionLostRetries < maxRetries
+        ) {
+          retryDelayMs =
+            backoffMs[Math.min(connectionLostRetries, backoffMs.length - 1)] ?? 0;
+          connectionLostRetries += 1;
+        } else if (
+          ev.code === 'invoke_failed' &&
+          retryNotReadyUntilAbort &&
+          isIpcRetryableBeforeDispatch(ev.message)
+        ) {
+          retryDelayMs = notReadyRetryMs;
+        }
+        if (retryDelayMs !== null) {
+          void iterator.return?.(undefined);
+          if (callerSignal?.aborted) {
+            throw new DOMException('request aborted', 'AbortError');
+          }
+          await sleep(retryDelayMs, callerSignal);
+          if (callerSignal?.aborted) {
+            throw new DOMException('request aborted', 'AbortError');
+          }
+          break; // re-dispatch; the reconnecting Rust handle re-resolves first
         }
         throw terminalError(ev.code, ev.message);
       }
       // A body chunk before `head` shouldn't happen — ignore and keep reading.
     }
-
-    // Reached only by the retryable `break`. Close the dead call's iterator,
-    // honor a caller abort instead of redispatching into the void, back off,
-    // then loop to re-dispatch (which drives the Rust reconnect).
-    void iterator.return?.(undefined);
-    if (callerSignal?.aborted) throw new DOMException('request aborted', 'AbortError');
-    await sleep(backoffMs[Math.min(attempt, backoffMs.length - 1)], callerSignal);
-    if (callerSignal?.aborted) throw new DOMException('request aborted', 'AbortError');
   }
 }

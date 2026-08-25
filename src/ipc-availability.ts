@@ -54,6 +54,32 @@ export function isIpcNotWired(err: unknown): boolean {
 }
 
 /**
+ * The Tauri command failed before a request frame could cross the endpoint-IPC
+ * boundary, so retrying is safe even for a mutation.
+ *
+ * `invoke_failed` by itself is deliberately NOT enough. It also wraps failures
+ * from `IpcClient::invoke` while writing a request to an existing socket; at
+ * that point delivery is ambiguous and replaying a POST could duplicate an
+ * already-applied mutation. These three details are emitted earlier:
+ *
+ *  - `state not managed` — Tauri never entered the Rust command;
+ *  - `no endpoint-ipc socket available` — the reconnecting handle resolved no
+ *    live advertisement and never constructed an `IpcClient`;
+ *  - `endpoint-ipc connect:` — opening the socket failed before `invoke()`.
+ *
+ * This narrow predicate is the safe retry boundary for one-shot fetches. The
+ * broader {@link isIpcNotReady} remains appropriate for idempotent streams.
+ */
+export function isIpcRetryableBeforeDispatch(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('state not managed') ||
+    msg.includes('no endpoint-ipc socket available') ||
+    msg.includes('endpoint-ipc connect:')
+  );
+}
+
+/**
  * The bridge exists but has no socket to dial yet. Retryable — under `requireIpc`
  * the caller should stay CONNECTING rather than burn one of the webview's ~6
  * per-host sockets on a fallback that would then hold it for the whole session.

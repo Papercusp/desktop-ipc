@@ -50,9 +50,11 @@ export interface DesktopIpcConfig {
    *    bridge instead of burning one of ~6 per-host sockets for the session.
    *    This is strictly better than falling back: the stream connects the moment
    *    the bridge is up, and boot is unaffected.
-   *  - **Fetch** rejects loudly with a named error instead of replaying the
-   *    request over HTTP, so a broken bridge surfaces as a visible failure
-   *    rather than a slow, mysterious degradation.
+   *  - **Fetch** keeps a proven PRE-DISPATCH "not ready yet" request pending
+   *    and retries until its AbortSignal fires or IPC reconnects. This is safe
+   *    even for POST: no request frame crossed the bridge. Ambiguous failures
+   *    after dispatch still reject loudly instead of replaying over HTTP, so a
+   *    broken bridge remains visible rather than becoming a slow degradation.
    *
    * `forceHttp` still overrides this — it stays the deliberate rollback lever.
    */
@@ -85,8 +87,9 @@ export interface DesktopIpcConfig {
    * IPC bridge hasn't connected) while its cost is permanent: a long-lived SSE
    * connection holds one of WebKitGTK/libsoup's ~6 per-host sockets for the
    * whole session. Waiting a beat is the better trade for a stream that will
-   * live for hours; it is NOT the better trade for a one-shot fetch, which is
-   * why `ipcFetch` still falls back per call. Default
+   * live for hours. Under `requireIpc`, one-shot fetches reuse the retry cadence
+   * only for failures proven to precede dispatch; legacy/rollback mode still
+   * falls back per call. Default
    * {@link DEFAULT_IPC_STARTUP_GRACE_MS}.
    */
   ipcStartupGraceMs?: number;

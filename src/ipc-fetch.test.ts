@@ -270,6 +270,113 @@ describe('ipcFetch', () => {
     expect(calls()).toBe(1);
   });
 
+  // ── requireIpc pre-dispatch retry (operator advertisement restart) ──
+  //
+  // Unlike `connection_lost`, these failures happen before Rust can write a
+  // request frame. Retrying is therefore safe for POST as well as GET — the
+  // owner-visible regression was the Papercup chat POST surfacing a stale
+  // endpoint-ipc.<port>.json error during an operator restart.
+
+  it('retries a POST across proven pre-dispatch not-ready failures and succeeds', async () => {
+    let calls = 0;
+    const dispatch: DispatchEndpointStreamFn = async function* () {
+      calls += 1;
+      if (calls <= 2) {
+        yield {
+          kind: 'error',
+          code: 'invoke_failed',
+          message:
+            'invoke_failed: no endpoint-ipc socket available — selected port 3270: restart orphan',
+        };
+        return;
+      }
+      yield {
+        kind: 'event',
+        name: 'head',
+        data: { status: 200, headers: { 'content-type': 'application/json' } },
+      };
+      yield { kind: 'binary', name: 'body', data: new TextEncoder().encode('{"ok":true}') };
+      yield { kind: 'done', result: { content: [] } };
+    };
+
+    const res = await ipcFetch(
+      '/api/agent-mcp/operator-converse',
+      { method: 'POST', body: '{}' },
+      { dispatch, retry: { sleep: async () => {} } },
+    );
+
+    expect(await res.text()).toBe('{"ok":true}');
+    expect(calls).toBe(3);
+  });
+
+  it('does not replay an ambiguous invoke_failed POST that may have crossed the socket', async () => {
+    let calls = 0;
+    const dispatch: DispatchEndpointStreamFn = async function* () {
+      calls += 1;
+      yield { kind: 'error', code: 'invoke_failed', message: 'Broken pipe' };
+    };
+
+    await expect(
+      ipcFetch(
+        '/api/agent-mcp/operator-converse',
+        { method: 'POST', body: '{}' },
+        { dispatch, retry: { sleep: async () => {} } },
+      ),
+    ).rejects.toThrow(/invoke_failed/);
+    expect(calls).toBe(1);
+  });
+
+  it('stops a not-ready retry loop when the caller aborts', async () => {
+    const ctrl = new AbortController();
+    let calls = 0;
+    const dispatch: DispatchEndpointStreamFn = async function* () {
+      calls += 1;
+      yield {
+        kind: 'error',
+        code: 'invoke_failed',
+        message: 'invoke_failed: endpoint-ipc connect: No such file or directory',
+      };
+    };
+
+    await expect(
+      ipcFetch(
+        '/api/agent-mcp/operator-converse',
+        { method: 'POST', body: '{}', signal: ctrl.signal },
+        {
+          dispatch,
+          retry: {
+            sleep: async () => {
+              ctrl.abort();
+            },
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).toBe(1);
+  });
+
+  it('keeps legacy requireIpc:false behavior: no not-ready retry inside ipcFetch', async () => {
+    const { configureDesktopIpc } = await import('./config');
+    configureDesktopIpc({ requireIpc: false });
+    let calls = 0;
+    const dispatch: DispatchEndpointStreamFn = async function* () {
+      calls += 1;
+      yield {
+        kind: 'error',
+        code: 'invoke_failed',
+        message: 'invoke_failed: no endpoint-ipc socket available — no advertisement',
+      };
+    };
+    try {
+      await expect(
+        ipcFetch('/api/x', {}, { dispatch, retry: { sleep: async () => {} } }),
+      ).rejects.toThrow(/invoke_failed/);
+      expect(calls).toBe(1);
+    } finally {
+      configureDesktopIpc({ requireIpc: undefined });
+    }
+  });
+
   it('does NOT retry connection_lost after head — errors the body stream once', async () => {
     let n = 0;
     const dispatch: DispatchEndpointStreamFn = async function* () {
