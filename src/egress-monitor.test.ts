@@ -355,6 +355,9 @@ describe('foreign-origin axis', () => {
       r('http://localhost:3070/assets/app.js', 10),
       r('http://127.0.0.1:3270/api/harness/list', 20),
       r('http://[::1]:3070/assets/x.css', 30),
+      // WebView2 maps Tauri's `ipc://localhost` custom protocol onto this
+      // pseudo-origin. It is native IPC, not a third-party network request.
+      r('http://ipc.localhost/endpoint_invoke', 40),
     ];
 
     for (const origin of [ORIGIN, PACKAGED_ORIGIN]) {
@@ -362,6 +365,17 @@ describe('foreign-origin axis', () => {
       expect(report.foreignOrigin.total).toBe(0);
       expect(report.foreignOrigin.verdict).toBe('clean');
     }
+  });
+
+  it('matches the localhost label boundary without allowlisting lookalike domains', () => {
+    const report = classifyEgress(
+      [r('https://ipc.localhost.example.com/endpoint_invoke', 10)],
+      { documentOrigin: ORIGIN },
+      PROVEN,
+    );
+
+    expect(report.foreignOrigin.total).toBe(1);
+    expect(report.foreignOrigin.byOrigin['https://ipc.localhost.example.com']).toBeTruthy();
   });
 
   it('keeps the two axes independent', () => {

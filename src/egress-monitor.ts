@@ -197,6 +197,20 @@ export interface EgressReport {
  */
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
 
+/**
+ * Browser engines represent native custom protocols differently. WebView2 maps
+ * Tauri's `ipc://localhost/<command>` transport to the owned pseudo-origin
+ * `http://ipc.localhost/<command>` before it reaches Resource Timing. Every
+ * `*.localhost` name is loopback-special by definition, so classifying that
+ * mapping as third-party egress creates a Windows-only false alarm on every
+ * native invoke. Match a label boundary, never a substring: a host such as
+ * `ipc.localhost.example.com` remains foreign.
+ */
+function isLocalHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/\.$/, '');
+  return LOCAL_HOSTNAMES.has(normalized) || normalized.endsWith('.localhost');
+}
+
 /** Bounded so a pathological page cannot grow this without limit. */
 export const EGRESS_RING_SIZE = 200;
 
@@ -333,7 +347,7 @@ export function classifyEgress(
     // the transport axis and discards precisely the foreign origins this axis
     // exists to catch — running it first is the exact bug that made the monitor
     // blind to six public-CDN fetches for months.
-    if (!LOCAL_HOSTNAMES.has(url.hostname) && !allowedOrigins.has(url.origin)) {
+    if (!isLocalHostname(url.hostname) && !allowedOrigins.has(url.origin)) {
       const foreign: EgressEntry = {
         path,
         url: url.href,
