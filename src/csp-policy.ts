@@ -60,6 +60,10 @@ export const CSP_ENFORCING_HEADER = 'Content-Security-Policy';
 const LOCAL_SOURCES = [
   "'self'",
   'papercusp:',
+  // WebView2 maps Tauri's `ipc://localhost/...` transport to this exact
+  // owned pseudo-origin. Keep the host exact: a wildcard would bless
+  // unrelated origins rather than only the native IPC bridge.
+  'http://ipc.localhost',
   'http://localhost:*',
   'http://127.0.0.1:*',
   'ws://localhost:*',

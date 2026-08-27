@@ -32,7 +32,7 @@ function foreignHostsIn(policy: string): string[] {
   // four local sources as foreign.
   return [...policy.matchAll(/https?:\/\/([^\s;]+)/g)]
     .map((m) => m[1].replace(/:\*$/, ''))
-    .filter((host) => host !== 'localhost' && host !== '127.0.0.1');
+    .filter((host) => !['localhost', '127.0.0.1', 'ipc.localhost'].includes(host));
 }
 
 describe('LOCAL_ONLY_CSP (P-006)', () => {
@@ -62,9 +62,22 @@ describe('LOCAL_ONLY_CSP (P-006)', () => {
   });
 
   it('permits every LOCAL source, so a local-only app produces zero reports', () => {
-    for (const src of ["'self'", 'papercusp:', 'http://localhost:*', 'http://127.0.0.1:*']) {
+    for (const src of [
+      "'self'",
+      'papercusp:',
+      'http://ipc.localhost',
+      'http://localhost:*',
+      'http://127.0.0.1:*',
+    ]) {
       expect(LOCAL_ONLY_CSP).toContain(src);
     }
+  });
+
+  it('allows only the owned IPC pseudo-origin, not a lookalike remote host', () => {
+    expect(foreignHostsIn("connect-src 'self' http://ipc.localhost")).toEqual([]);
+    expect(foreignHostsIn("connect-src 'self' https://ipc.localhost.evil.example")).toEqual([
+      'ipc.localhost.evil.example',
+    ]);
   });
 
   it('permits inline/eval/blob/data so the stream is not drowned in non-egress noise', () => {
