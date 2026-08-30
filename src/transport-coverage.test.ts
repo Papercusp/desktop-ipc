@@ -650,7 +650,16 @@ const PORTAL_CONTROL_PLANE_CONTRACT = [
   {
     id: 'sync-sse-adapter',
     file: 'libs/generic/sync/src/transports/sse/SSEAdapter.tsx',
-    sourceNeedle: 'createResilientEventSource({',
+    // Re-pointed 2026-08-30: the adapter's resilience (jitter, zombie watchdog,
+    // backoff, visibility pause) moved into @papercusp/sse's cross-tab control
+    // wrapper, which COMPOSES createResilientEventSource — so the adapter no
+    // longer calls that function directly and the old needle went stale ~28min
+    // after the refactor landed. Pinned on the new composition point rather
+    // than deleted, so the guard keeps its teeth: a raw `new EventSource(...)`
+    // here would still trip it. (Nothing selected this test when the refactor
+    // landed — a libs/generic/sync change does not pull in desktop-ipc's
+    // workspace under test:affected, which is why it went red silently.)
+    sourceNeedle: 'createCrossTabControlStream({',
   },
 ] as const;
 
