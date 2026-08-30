@@ -753,4 +753,86 @@ describe('IpcEventSource', () => {
       }
     });
   });
+
+  // EI-21901142049365796 — the NOT-WIRED rollback lever (`PAPERCUSP_DESKTOP_IPC=0`,
+  // or a webview refusing `ipc://`) must reach native SSE even under the DEFAULT
+  // requireIpc config. The run-loop already latched + terminated on not-wired,
+  // but the constructor's fallback branch was gated on `!isRequireIpc()`, so
+  // every resilient-wrapper rebuild produced another doomed IpcEventSource:
+  // fetch fell back per-call and worked while SSE stayed dead for the whole
+  // session (measured on the P-017 browser leg: 0 SSE events, polling fallback
+  // at 2.7× the idle request rate). These pin the not-wired escape hatch.
+  describe('not-wired rollback lever falls back under requireIpc (EI-21901142049365796)', () => {
+    class FakeNativeEventSource {
+      static created: string[] = [];
+      url: string;
+      constructor(url: string | URL) {
+        this.url = String(url);
+        FakeNativeEventSource.created.push(this.url);
+      }
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      close(): void {}
+    }
+
+    function reset(): void {
+      FakeNativeEventSource.created = [];
+      configureDesktopIpc({ ipcStartupGraceMs: undefined, requireIpc: undefined });
+      _resetIpcEventSourceFallback();
+    }
+
+    it('latches + closes on ipc_disabled WITHOUT waiting out the startup grace, then hands the next construction a native EventSource despite requireIpc', async () => {
+      // The default config keeps requireIpc ON — assert that premise so this
+      // test fails loudly if the default ever flips (it would then pin nothing).
+      expect(DEFAULT_REQUIRE_IPC).toBe(true);
+      // A HUGE grace proves not-wired short-circuits it: with the old code the
+      // source would sit in 'ipc-wait' for the whole grace instead of latching.
+      configureDesktopIpc({ ipcStartupGraceMs: 60_000, requireIpc: undefined });
+      setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
+      try {
+        const d = dispatcherFromQueue();
+        const es1 = new IpcEventSource('/api/zero-harness/sse', { dispatch: d.dispatch });
+        d.push({
+          kind: 'error',
+          code: 'ipc_disabled',
+          message: 'ipc_disabled: PAPERCUSP_DESKTOP_IPC=0',
+        });
+        await waitFor(() => es1.readyState === 2);
+        // The injected-dispatch source itself never falls back (it IS the probe).
+        expect(es1).toBeInstanceOf(IpcEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(0);
+
+        // The rebuild (what createResilientEventSource does on CLOSED) must now
+        // get native SSE — this is the branch that was dead under requireIpc.
+        const es2 = new IpcEventSource('/api/zero-harness/sse');
+        expect(es2).toBeInstanceOf(FakeNativeEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(1);
+      } finally {
+        reset();
+      }
+    });
+
+    it('a NOT-READY error under requireIpc still refuses the fallback (the WI-6512 discipline is untouched)', async () => {
+      configureDesktopIpc({ ipcStartupGraceMs: 0, requireIpc: true });
+      setNativeEventSourceFallback(FakeNativeEventSource as unknown as typeof EventSource);
+      try {
+        const d = dispatcherFromQueue();
+        const es1 = new IpcEventSource('/api/zero-harness/sse', { dispatch: d.dispatch });
+        d.push({ kind: 'error', code: 'invoke_failed', message: 'state not managed' });
+        // Stays CONNECTING (retry-forever), never CLOSED.
+        await new Promise((r) => setTimeout(r, 50));
+        expect(es1.readyState).toBe(0);
+        es1.close();
+
+        // And a fresh construction must NOT take the native path — nothing
+        // latched a not-wired reason.
+        const es2 = new IpcEventSource('/api/zero-harness/sse', { dispatch: d.dispatch });
+        expect(es2).toBeInstanceOf(IpcEventSource);
+        expect(FakeNativeEventSource.created).toHaveLength(0);
+        es2.close();
+      } finally {
+        reset();
+      }
+    });
+  });
 });

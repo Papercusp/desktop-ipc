@@ -72,6 +72,21 @@ let nativeEventSourceCtor: typeof EventSource | undefined;
  */
 let ipcUnavailableUntilMs = 0;
 
+/**
+ * WHY the latch was set (EI-21901142049365796). `requireIpc` forbids the
+ * constructor fallback only for a bridge that is *coming up* — a NOT-WIRED
+ * backend (`PAPERCUSP_DESKTOP_IPC=0`, an `ipc://`-refusing webview) is never
+ * coming up, and `ipc-availability`'s contract says callers must fall back to
+ * HTTP even under `requireIpc`. Without this reason the run-loop latched
+ * correctly but the constructor ignored the latch under the default
+ * (requireIpc) config, so every resilient-wrapper rebuild produced another
+ * doomed IpcEventSource: SSE silently dead for the whole session under the
+ * rollback lever, while `ipcFetch` (per-call decision) kept working — the
+ * split-brain measured on the P-017 browser leg (0 SSE events, polling at
+ * 2.7× the idle request rate).
+ */
+let ipcLatchReason: 'not-wired' | 'not-ready' | null = null;
+
 export function setNativeEventSourceFallback(ctor: typeof EventSource | undefined): void {
   nativeEventSourceCtor = ctor;
 }
@@ -86,8 +101,9 @@ function ipcStreamingLatched(): boolean {
  * Re-latching on a failed re-probe is what keeps a genuinely IPC-less webview
  * from paying a doomed invoke per `createResilientEventSource` rebuild.
  */
-function latchIpcUnavailable(): void {
+function latchIpcUnavailable(reason: 'not-wired' | 'not-ready'): void {
   ipcUnavailableUntilMs = Date.now() + getIpcStreamFallbackCooldownMs();
+  ipcLatchReason = reason;
 }
 
 /**
@@ -97,12 +113,14 @@ function latchIpcUnavailable(): void {
  */
 function clearIpcUnavailable(): void {
   ipcUnavailableUntilMs = 0;
+  ipcLatchReason = null;
 }
 
 /** Test-only reset of the module-level fallback latch + native ctor. */
 export function _resetIpcEventSourceFallback(): void {
   nativeEventSourceCtor = undefined;
   ipcUnavailableUntilMs = 0;
+  ipcLatchReason = null;
 }
 
 // Availability classification lives in its own leaf module (`ipc-availability`)
@@ -219,12 +237,16 @@ export class IpcEventSource extends EventTarget {
     // what lets a boot-window failure heal instead of stranding every stream on
     // native HTTP for the life of the webview (WI-6255).
     //
-    // ⚠ Skipped entirely under `isRequireIpc()` (the DEFAULT): a stream that
-    // falls back holds one of libsoup's ~6 per-host sockets for the whole
-    // session, which is the bug this package exists to prevent. Waiting for the
-    // bridge is strictly better for a stream that will live for hours.
+    // ⚠ Skipped under `isRequireIpc()` (the DEFAULT) — UNLESS the latch reason
+    // is NOT-WIRED (EI-21901142049365796). requireIpc's rationale is that a
+    // fallback stream burns one of libsoup's ~6 per-host sockets while the
+    // bridge is merely *coming up*; a not-wired bridge (`PAPERCUSP_DESKTOP_IPC=0`,
+    // a webview refusing `ipc://`) is never coming up, and per ipc-availability's
+    // contract the operator has CHOSEN HTTP — refusing the fallback here left
+    // every rebuild a doomed IpcEventSource and SSE silently dead for the whole
+    // session under the rollback lever.
     if (
-      !isRequireIpc() &&
+      (!isRequireIpc() || ipcLatchReason === 'not-wired') &&
       ipcStreamingLatched() &&
       nativeEventSourceCtor &&
       !init?.dispatch
@@ -395,7 +417,12 @@ export class IpcEventSource extends EventTarget {
           // latch so the next EventSource builds a native one (HTTP fallback).
           // A non-IPC-unavailable error is a transient drop → reconnect.
           if (isIpcUnavailableMessage(`${ev.code} ${ev.message}`)) {
-            if (this.inStartupGrace()) return 'ipc-wait';
+            const notWired = isIpcNotWired(`${ev.code} ${ev.message}`);
+            // NOT-WIRED skips the startup grace: nothing will create the bridge
+            // later, so the grace only delays the latch (and the native
+            // fallback the wrapper's rebuild picks up) by a few pointless
+            // seconds per source (EI-21901142049365796).
+            if (!notWired && this.inStartupGrace()) return 'ipc-wait';
             // requireIpc: never burn a socket on native HTTP. Stay retryable
             // forever and say so LOUDLY — a silent revert to HTTP is what hid
             // this defect for two months (WI-6512).
@@ -406,11 +433,11 @@ export class IpcEventSource extends EventTarget {
             // wait. That env var is a deliberate rollback lever — treat it like
             // `forceHttp` and fall back, or pulling it would break the app at
             // the exact moment someone reached for it.
-            if (isRequireIpc() && !isIpcNotWired(`${ev.code} ${ev.message}`)) {
+            if (isRequireIpc() && !notWired) {
               this.warnIpcUnavailableOnce(`${ev.code} ${ev.message}`);
               return 'ipc-wait';
             }
-            latchIpcUnavailable();
+            latchIpcUnavailable(notWired ? 'not-wired' : 'not-ready');
             this.terminate();
             return 'fatal';
           }
@@ -425,12 +452,13 @@ export class IpcEventSource extends EventTarget {
       if (isIpcUnavailableMessage(msg)) {
         // Unavailable backend that THREW rather than yielding an error. Same
         // startup-grace and not-wired rules as the yielded-error path above.
-        if (this.inStartupGrace()) return 'ipc-wait';
-        if (isRequireIpc() && !isIpcNotWired(msg)) {
+        const notWired = isIpcNotWired(msg);
+        if (!notWired && this.inStartupGrace()) return 'ipc-wait';
+        if (isRequireIpc() && !notWired) {
           this.warnIpcUnavailableOnce(msg);
           return 'ipc-wait';
         }
-        latchIpcUnavailable();
+        latchIpcUnavailable(notWired ? 'not-wired' : 'not-ready');
         this.terminate();
         return 'fatal';
       }
