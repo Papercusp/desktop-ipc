@@ -10,13 +10,39 @@
  * standing rule is to re-measure a premise rather than inherit it — D-006, D-008,
  * D-037, D-038 and D-040 were each refuted or re-shaped on contact:
  *
- *  - **The operator serves ZERO WebSocket endpoints.** Not one `upgradeWebSocket`
- *    route exists on the Hono host, and every `WebSocketServer` in the tree binds
- *    its OWN dedicated port (`{ port }`) — `desktop-voice-ws` (3076), `pty-ws`
- *    (3056), `device-voice-ws`, `frame-vnc`. There is no `noServer:true` and no
- *    `{ server }` attachment anywhere, so no socket shares the operator's HTTP
- *    listener. A same-origin `/api` WebSocket is therefore not merely absent, it
- *    is unserved: there is nothing on the other end for a shim to reach.
+ *  - **No WebSocket endpoint shares the LOCAL operator's HTTP listener.** Not one
+ *    `upgradeWebSocket` route exists on the local Hono host, and every
+ *    `WebSocketServer` it can reach binds its OWN dedicated port (`{ port }`) —
+ *    `desktop-voice-ws` (3076), `pty-ws` (3056), `device-voice-ws`, `frame-vnc`.
+ *    So for the desktop webview this guard protects, a same-origin `/api`
+ *    WebSocket is not merely absent, it is unserved: there is nothing on the other
+ *    end for a shim to reach.
+ *
+ *    ⚠ CORRECTED 2026-08-30 (EI-21855861879191381) — READ THIS BEFORE REUSING THE
+ *    BULLET ABOVE AS A PREMISE. It used to end: "There is no `noServer:true` and no
+ *    `{ server }` attachment ANYWHERE, so no socket shares the operator's HTTP
+ *    listener." That word is now false. `apps/operator/bin/hosted-handler.ts` — the
+ *    HOSTED (app.papercusp.com) runtime, which did not exist when this was measured
+ *    on 2026-08-03 — builds `new WebSocketServer({ noServer: true })` and serves
+ *    `/api/hosted/connectors/socket` from an `upgrade()` hook on the SAME handler
+ *    that mounts `/api/*` and the SPA. It is ticket-authenticated (`?ticket=ht_…`)
+ *    and carries BOTH the reverse connector and the browser side of a hosted
+ *    workspace session; `apps/operator/app/cloud-workspaces/HostedWorkspaceSession
+ *    .tsx` opens it at `window.location.origin`.
+ *
+ *    THE GUARD'S DECISION BELOW STILL STANDS, and the scope is exactly why: that
+ *    socket lives in a DIFFERENT RUNTIME from the desktop webview, which talks to
+ *    its own local host, so nothing the desktop can reach has changed. What HAS
+ *    changed is that the browser portal — where `installDesktopIpcPolyfills` never
+ *    runs, so none of this file executes — now has a real same-origin WebSocket
+ *    and no guard on it at all. Classifying that is the portal transport
+ *    inventory's job, not this file's to route.
+ *
+ *    `packages/operator-core/lib/doc-claims/same-listener-websocket-sites.test.ts`
+ *    now PINS the corrected claim against the real tree, so the NEXT same-listener
+ *    attachment fails a test instead of silently rotting this paragraph the way the
+ *    original did. That the first one went unnoticed is the actual defect here: a
+ *    guard kept passing while the measurement justifying it quietly expired.
  *  - **All four client call sites target a different LISTENER.** voice x2 and
  *    video default to `ws://127.0.0.1:3076/api/desktop/voice` — a separate
  *    sidecar port, under the one prefix D-008 sanctions for the native transport.
