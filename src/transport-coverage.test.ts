@@ -509,7 +509,17 @@ const PORTAL_BULK_TRANSFERS: readonly PortalInventoryEntry[] = [
     'same single-use hosted workspace ticket',
     'BYOC workspace file plane',
     'bulk-transfer',
-    'base64-framed file data is separately budgeted from control traffic',
+    // CORRECTED 2026-08-31 (WI-1748711). This previously read "base64-framed
+    // file data is separately budgeted from control traffic", which is FALSE
+    // browser-side and had been standing as this entry's whole justification.
+    // Verified in source: HostedWorkspaceSession.tsx upload() does
+    // arrayBuffer() -> base64 -> a SINGLE send(), and send() is a bare
+    // socket.send(JSON.stringify(payload)) on the same socketRef that carries
+    // desktop.roster and terminal I/O. Nothing budgets it, nothing chunks it,
+    // nothing applies backpressure. A relay may budget downstream, but that
+    // cannot help the browser socket, which is where the head-of-line blocking
+    // and the ~1.33x memory cost actually land.
+    'NOT budgeted browser-side: the whole base64 file goes as one frame on the control socket, head-of-line blocking control messages behind it (WI-1748711); the P-021 transfer plane in @papercusp/sync is the intended fix once a transfer origin exists',
   ),
   opener(
     'voice-settings-preview-audio',
