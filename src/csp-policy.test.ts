@@ -18,6 +18,7 @@ import {
   CSP_REPORT_ONLY_HEADER,
   LOCAL_ONLY_CSP,
   cspReportOnlyHeaders,
+  crossOriginIsolationHeaders,
 } from './csp-policy';
 
 /**
@@ -94,5 +95,25 @@ describe('LOCAL_ONLY_CSP (P-006)', () => {
     // HMR/sync socket would otherwise report as a violation on every page load.
     expect(LOCAL_ONLY_CSP).toMatch(/connect-src[^;]*ws:\/\/localhost:\*/);
     expect(LOCAL_ONLY_CSP).toMatch(/connect-src[^;]*ws:\/\/127\.0\.0\.1:\*/);
+  });
+});
+
+describe('crossOriginIsolationHeaders (P-005 / WI-4498)', () => {
+  it('sets both COOP and COEP — either alone does not cross-origin-isolate', () => {
+    const headers = crossOriginIsolationHeaders();
+    expect(headers['Cross-Origin-Opener-Policy']).toBe('same-origin');
+    expect(headers['Cross-Origin-Embedder-Policy']).toBe('require-corp');
+  });
+
+  it('is ENFORCING, not report-only — there is no report-only variant of COOP/COEP', () => {
+    // Distinct from the CSP pair above: unlike Content-Security-Policy, neither
+    // header has a "-Report-Only" form, so this must never be gated behind the
+    // report-only mechanism above — asserting the literal names catches a typo
+    // (e.g. 'unsafe-none' / 'credentialless') silently downgrading isolation.
+    const headers = crossOriginIsolationHeaders();
+    expect(Object.keys(headers).sort()).toEqual([
+      'Cross-Origin-Embedder-Policy',
+      'Cross-Origin-Opener-Policy',
+    ]);
   });
 });

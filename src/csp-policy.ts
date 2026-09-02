@@ -105,3 +105,34 @@ export const LOCAL_ONLY_CSP: string = [
 export function cspReportOnlyHeaders(): Record<string, string> {
   return { [CSP_REPORT_ONLY_HEADER]: LOCAL_ONLY_CSP };
 }
+
+/**
+ * Cross-origin isolation headers (P-005 wake-word investigation, WI-4498).
+ *
+ * `SharedArrayBuffer` — and therefore onnxruntime-web's THREADED wasm backend,
+ * which is the only backend it ships at the pinned version (no single-threaded
+ * `ort-wasm-simd.wasm` asset exists) — is only available to a document that is
+ * "cross-origin isolated". A document becomes cross-origin isolated when it is
+ * served with BOTH of these headers together; either one alone does nothing.
+ *
+ * Unlike the CSP above this pair is safe to set unconditionally here: every
+ * subresource this app loads is same-origin (the SPA document, its hashed JS/
+ * CSS/wasm bundle, and the `/api`+`/internal/docs` proxy targets are all served
+ * by the SAME Hono host that serves this document — see host-spa.ts / this
+ * file's other call site in operator-vite's dev server). A `require-corp`
+ * embedder policy only requires an explicit `Cross-Origin-Resource-Policy`
+ * header on CROSS-origin subresources; same-origin ones are exempt by spec, so
+ * this app's asset responses need no matching change.
+ *
+ * `Cross-Origin-Opener-Policy: same-origin` additionally isolates the
+ * document's browsing-context group from any cross-origin window that could
+ * hold a reference to it — required for isolation, and harmless here since
+ * this app never opens/is-opened-by a cross-origin window (`window.open` isn't
+ * used against a foreign origin; the desktop shell is single-window).
+ */
+export function crossOriginIsolationHeaders(): Record<string, string> {
+  return {
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Embedder-Policy': 'require-corp',
+  };
+}
