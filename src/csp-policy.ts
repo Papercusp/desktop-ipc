@@ -1,3 +1,5 @@
+import cspPolicy from './csp-policy.json';
+
 /**
  * The Content-Security-Policy for a local-first desktop app
  * (egress-monitor-origin-axis-2026-08-02 P-006).
@@ -43,7 +45,7 @@
  * The report-only header name. Report-only is HEADER-ONLY by spec: setting this
  * as a `<meta http-equiv>` does nothing at all.
  */
-export const CSP_REPORT_ONLY_HEADER = 'Content-Security-Policy-Report-Only';
+export const CSP_REPORT_ONLY_HEADER = cspPolicy.reportOnlyHeader;
 
 /** The enforcing header name, for the eventual flip. Not used yet. */
 export const CSP_ENFORCING_HEADER = 'Content-Security-Policy';
@@ -57,33 +59,6 @@ export const CSP_ENFORCING_HEADER = 'Content-Security-Policy';
  * on several ports (3055 vite, 3070 operator, 3170 staging, 3270 desktop, and
  * whatever an isolated e2e run picks).
  */
-const LOCAL_SOURCES = [
-  "'self'",
-  'papercusp:',
-  // WebView2 maps Tauri's `ipc://localhost/...` transport to this exact
-  // owned pseudo-origin. Keep the host exact: a wildcard would bless
-  // unrelated origins rather than only the native IPC bridge.
-  'http://ipc.localhost',
-  'http://localhost:*',
-  'http://127.0.0.1:*',
-  'ws://localhost:*',
-  'ws://127.0.0.1:*',
-] as const;
-
-/**
- * Shapes that never leave the machine, so they cannot be egress and must not
- * generate reports. `blob:` and `data:` are how workers, generated images and
- * inlined assets load; the egress monitor skips them for the same reason
- * (NETWORK_SCHEMES excludes them).
- */
-const INERT_SOURCES = ['blob:', 'data:'] as const;
-
-/**
- * Deliberately allowed — see the header. These are about HOW code runs, not
- * WHERE it is fetched from, so they are outside this policy's question.
- */
-const EXECUTION_RELAXATIONS = ["'unsafe-inline'", "'unsafe-eval'"] as const;
-
 /**
  * The policy. One directive: `default-src` covers every fetch directive that is
  * not otherwise specified, which is exactly the breadth we want — a foreign
@@ -92,10 +67,7 @@ const EXECUTION_RELAXATIONS = ["'unsafe-inline'", "'unsafe-eval'"] as const;
  * `connect-src` is spelled out separately ONLY because it must also carry the
  * websocket schemes; `default-src` does not reliably cover `ws:` across engines.
  */
-export const LOCAL_ONLY_CSP: string = [
-  `default-src ${[...LOCAL_SOURCES, ...INERT_SOURCES, ...EXECUTION_RELAXATIONS].join(' ')}`,
-  `connect-src ${[...LOCAL_SOURCES, ...INERT_SOURCES].join(' ')}`,
-].join('; ');
+export const LOCAL_ONLY_CSP: string = cspPolicy.policy;
 
 /**
  * The header pair to attach to an SPA **document** response. A CSP applies to
