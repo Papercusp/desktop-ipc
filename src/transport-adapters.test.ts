@@ -140,6 +140,52 @@ describe('raw Tauri Channel binary messages (WI-5911)', () => {
     expect(event.data.buffer).toBe(raw);
   });
 
+  it('preserves typed-array offsets and accepts JSON-decoded numeric byte arrays', async () => {
+    const { decodeRawBinaryEvent } = await import('./ipc-stream');
+    const raw = new Uint8Array(rawEvent('body', [0xde, 0xad, 0xbe, 0xef]));
+    const padded = new Uint8Array(raw.byteLength + 7);
+    padded.set(raw, 3);
+
+    const fromView = decodeRawBinaryEvent(padded.subarray(3, 3 + raw.byteLength));
+    const fromNumbers = decodeRawBinaryEvent(Array.from(raw));
+
+    expect(Array.from(fromView.data)).toEqual([0xde, 0xad, 0xbe, 0xef]);
+    expect(fromView.data.buffer).toBe(padded.buffer);
+    expect(fromView.data.byteOffset).toBe(3 + 12 + 'body'.length);
+    expect(Array.from(fromNumbers.data)).toEqual([0xde, 0xad, 0xbe, 0xef]);
+  });
+
+  it('dispatches a numeric-array raw body before the terminal done event', async () => {
+    const raw = rawEvent('body', [0xde, 0xad, 0xbe, 0xef]);
+    vi.doMock('@tauri-apps/api/core', () => ({
+      Channel: class MockChannel<T> {
+        onmessage: ((message: T) => void) | null = null;
+      },
+      invoke: vi.fn(async (command: string, args?: {
+        channel?: { onmessage: ((message: unknown) => void) | null };
+      }) => {
+        if (command === 'endpoint_invoke') {
+          args?.channel?.onmessage?.(Array.from(new Uint8Array(raw)));
+          args?.channel?.onmessage?.({ kind: 'done', result: { content: [] } });
+          return 42;
+        }
+        return undefined;
+      }),
+    }));
+    const { dispatchEndpointStreamIpc } = await import('./ipc-stream');
+
+    const events = [];
+    for await (const event of dispatchEndpointStreamIpc('plans:get', {})) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.kind)).toEqual(['binary', 'done']);
+    expect((events[0] as { name: string }).name).toBe('body');
+    expect(Array.from((events[0] as { data: Uint8Array }).data)).toEqual([
+      0xde, 0xad, 0xbe, 0xef,
+    ]);
+  });
+
   it('rejects truncated and name-overflow raw frames instead of hanging the stream', async () => {
     const { decodeRawBinaryEvent } = await import('./ipc-stream');
     expect(() => decodeRawBinaryEvent(new ArrayBuffer(11))).toThrow(/too short/);

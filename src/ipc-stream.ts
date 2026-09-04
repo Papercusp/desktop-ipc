@@ -7,11 +7,12 @@
  * dispatchProjectedToolStream → ctx.emit() → frame → Rust reader →
  * Channel<EndpointEvent> → here.
  *
- * WI-5911: binary events use Tauri v2's `InvokeResponseBody::Raw`, arriving as
- * ArrayBuffer on this SAME Channel. The raw message reuses the Node EVENT_BIN
- * payload byte-for-byte: [8B call id BE][4B name length BE][name][binary].
- * Reusing one channel matters: its message index preserves head → body → done
- * ordering even when a large raw payload takes Tauri's fetch fast path.
+ * WI-5911: binary events use Tauri v2's `InvokeResponseBody::Raw`. Depending on
+ * the webview/protocol path, that raw body arrives as an ArrayBuffer, an
+ * ArrayBufferView, or a JSON-decoded number[]. The message reuses the Node
+ * EVENT_BIN payload byte-for-byte: [8B call id BE][4B name length BE][name]
+ * [binary]. Reusing one channel matters: its message index preserves head →
+ * body → done ordering even when a large raw payload takes Tauri's fetch path.
  */
 
 import { Channel, invoke } from '@tauri-apps/api/core';
@@ -30,22 +31,61 @@ type RustEndpointEvent =
   | { kind: 'done'; result: { content: Array<{ type: string; [k: string]: unknown }> } }
   | { kind: 'error'; code: string; message: string };
 
-type RustEndpointMessage = RustEndpointEvent | ArrayBuffer;
+type RawBinaryPayload = ArrayBuffer | ArrayBufferView | readonly number[];
+type RustEndpointMessage = RustEndpointEvent | RawBinaryPayload;
 
 const EVENT_BIN_PREFIX_BYTES = 12; // 8-byte call id + 4-byte name length
 
-/** Decode the allocation-free raw message emitted by endpoint_ipc.rs. */
-export function decodeRawBinaryEvent(raw: ArrayBuffer): Extract<EndpointStreamEvent, { kind: 'binary' }> {
-  if (raw.byteLength < EVENT_BIN_PREFIX_BYTES) {
-    throw new Error(`raw EVENT_BIN payload too short: ${raw.byteLength} bytes`);
+function rawBinaryBytes(raw: RawBinaryPayload): Uint8Array {
+  if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+  if (ArrayBuffer.isView(raw)) {
+    return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
   }
-  const view = new DataView(raw);
+  for (const byte of raw) {
+    if (!Number.isInteger(byte) || byte < 0 || byte > 255) {
+      throw new Error(`raw EVENT_BIN payload contains invalid byte: ${String(byte)}`);
+    }
+  }
+  return Uint8Array.from(raw);
+}
+
+function isRawBinaryPayload(message: unknown): message is RawBinaryPayload {
+  return message instanceof ArrayBuffer || ArrayBuffer.isView(message) || Array.isArray(message);
+}
+
+function isRustEndpointEvent(message: unknown): message is RustEndpointEvent {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return false;
+  const candidate = message as Record<string, unknown>;
+  switch (candidate.kind) {
+    case 'event':
+      return typeof candidate.name === 'string';
+    case 'binary':
+      return typeof candidate.name === 'string' && typeof candidate.data === 'string';
+    case 'done': {
+      const result = candidate.result;
+      return result !== null
+        && typeof result === 'object'
+        && Array.isArray((result as Record<string, unknown>).content);
+    }
+    case 'error':
+      return typeof candidate.code === 'string' && typeof candidate.message === 'string';
+    default:
+      return false;
+  }
+}
+
+/** Decode the raw message emitted by endpoint_ipc.rs. Views remain zero-copy. */
+export function decodeRawBinaryEvent(raw: RawBinaryPayload): Extract<EndpointStreamEvent, { kind: 'binary' }> {
+  const bytes = rawBinaryBytes(raw);
+  if (bytes.byteLength < EVENT_BIN_PREFIX_BYTES) {
+    throw new Error(`raw EVENT_BIN payload too short: ${bytes.byteLength} bytes`);
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const nameLength = view.getUint32(8, false);
   const dataOffset = EVENT_BIN_PREFIX_BYTES + nameLength;
-  if (dataOffset > raw.byteLength) {
-    throw new Error(`raw EVENT_BIN name length ${nameLength} exceeds ${raw.byteLength} byte payload`);
+  if (dataOffset > bytes.byteLength) {
+    throw new Error(`raw EVENT_BIN name length ${nameLength} exceeds ${bytes.byteLength} byte payload`);
   }
-  const bytes = new Uint8Array(raw);
   const name = new TextDecoder().decode(bytes.subarray(EVENT_BIN_PREFIX_BYTES, dataOffset));
   return { kind: 'binary', name, data: bytes.subarray(dataOffset) };
 }
@@ -91,21 +131,27 @@ export async function* dispatchEndpointStreamIpc<TInput>(
   const channel = new Channel<RustEndpointMessage>();
   channel.onmessage = (message) => {
     let msg: EndpointStreamEvent;
+    let errorCode = 'invalid_channel_message';
     try {
-      msg =
-        message instanceof ArrayBuffer
-          ? decodeRawBinaryEvent(message)
-          : message.kind === 'binary'
-            ? {
-                kind: 'binary',
-                name: message.name,
-                data: base64ToUint8(message.data),
-              }
-            : message;
+      if (isRawBinaryPayload(message)) {
+        errorCode = 'invalid_binary_frame';
+        msg = decodeRawBinaryEvent(message);
+      } else if (!isRustEndpointEvent(message)) {
+        throw new Error('unsupported Tauri endpoint channel message shape');
+      } else if (message.kind === 'binary') {
+        errorCode = 'invalid_binary_frame';
+        msg = {
+          kind: 'binary',
+          name: message.name,
+          data: base64ToUint8(message.data),
+        };
+      } else {
+        msg = message;
+      }
     } catch (err) {
       queue.push({
         kind: 'error',
-        code: 'invalid_binary_frame',
+        code: errorCode,
         message: err instanceof Error ? err.message : String(err),
       });
       // This is a locally-synthesized terminal. Leave `done` false so finally
