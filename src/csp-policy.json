@@ -1,4 +1,4 @@
 {
-  "reportOnlyHeader": "Content-Security-Policy-Report-Only",
+  "header": "Content-Security-Policy",
   "policy": "default-src 'self' papercusp: http://ipc.localhost http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* blob: data: 'unsafe-inline' 'unsafe-eval'; connect-src 'self' papercusp: http://ipc.localhost http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* blob: data:"
 }

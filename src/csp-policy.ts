@@ -12,17 +12,27 @@ import cspPolicy from './csp-policy.json';
  * everything EXCEPT origin.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY IT IS REPORT-ONLY, AND WHY THAT IS NOT AVAILABLE FROM tauri.conf.json.
+ * WHY IT IS ENFORCING NOW, AND WHY THE HEADER IS NOT SET FROM tauri.conf.json.
  *
- * See plan decision D-004. Tauri 2.11.3 emits exactly one header name across its
- * whole source tree — the ENFORCING `Content-Security-Policy` — and
- * `tauri-utils` exposes exactly one field, `pub csp: Option<Csp>`. There is no
- * report-only variant. Nor can the usual escape hatch help:
- * `Content-Security-Policy-Report-Only` is header-only BY SPEC, so a
- * `<meta http-equiv>` tag is ignored by browsers.
+ * This policy shipped REPORT-ONLY first, deliberately: the enforcing header can
+ * break the app, so it was gated on a release condition written into the test —
+ * "this policy has never been validated against a real session".
  *
- * So the header is set by the servers that actually serve the SPA document,
- * which is what this module exists to keep consistent between them.
+ * That condition is now met, which is what licensed this flip. Measured against
+ * a live headless Tauri session (P-005 clause 4), navigating 13 route/tab
+ * combinations including every family D-001 flagged as historically CDN-backed
+ * (/editor-demo, /notes, /design, /cupboard — vditor, monaco, plantuml,
+ * excalidraw): ~2,400 resource loads, ONE origin, zero foreign origins, zero
+ * violations. The probe was proven live PER DOCUMENT rather than assumed — a
+ * `securitypolicyviolation` listener re-installed on each navigation and
+ * confirmed firing (controlSeen: 3) against a reserved `.invalid` host before
+ * each route's verdict was recorded, because a zero from an unproven probe is
+ * indistinguishable from a dead one.
+ *
+ * The header is still set by the servers rather than tauri.conf.json (D-004):
+ * Tauri 2.11.3 exposes exactly one field, `pub csp: Option<Csp>`, and its own
+ * asset-CSP rewriting is disabled here, so keeping all three servers on this one
+ * shared JSON is what stops them drifting apart.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY IT IS PERMISSIVE ABOUT EVERYTHING EXCEPT ORIGIN.
@@ -42,13 +52,27 @@ import cspPolicy from './csp-policy.json';
  */
 
 /**
- * The report-only header name. Report-only is HEADER-ONLY by spec: setting this
- * as a `<meta http-equiv>` does nothing at all.
+ * The enforcing header name — what we now actually serve.
+ *
+ * CSP is HEADER-ONLY for our purposes: a `<meta http-equiv>` tag cannot express
+ * report-only at all, and Tauri exposes no report-only field (D-004), which is
+ * why the servers below set the header themselves rather than tauri.conf.json.
  */
-export const CSP_REPORT_ONLY_HEADER = cspPolicy.reportOnlyHeader;
-
-/** The enforcing header name, for the eventual flip. Not used yet. */
 export const CSP_ENFORCING_HEADER = 'Content-Security-Policy';
+
+/**
+ * The header name this module actually serves, read from the shared JSON so the
+ * three servers (vite dev, host-spa, and the Rust `papercusp:` protocol, which
+ * `include_str!`s the same file) cannot drift apart. It is now the ENFORCING
+ * name; the assertion that it equals CSP_ENFORCING_HEADER is pinned in the test.
+ */
+export const CSP_HEADER: string = cspPolicy.header;
+
+/**
+ * The report-only header name. Retained ONLY as the thing we assert we do NOT
+ * serve — the report-only phase is over (see the flip note above).
+ */
+export const CSP_REPORT_ONLY_HEADER = 'Content-Security-Policy-Report-Only';
 
 /**
  * Sources that are "ours" and therefore never egress. Mirrors the loopback
@@ -74,8 +98,8 @@ export const LOCAL_ONLY_CSP: string = cspPolicy.policy;
  * the document it is served with, so attaching it to a .js or .css response
  * accomplishes nothing.
  */
-export function cspReportOnlyHeaders(): Record<string, string> {
-  return { [CSP_REPORT_ONLY_HEADER]: LOCAL_ONLY_CSP };
+export function cspHeaders(): Record<string, string> {
+  return { [CSP_HEADER]: LOCAL_ONLY_CSP };
 }
 
 /**

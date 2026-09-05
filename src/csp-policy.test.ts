@@ -15,9 +15,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   CSP_ENFORCING_HEADER,
+  CSP_HEADER,
   CSP_REPORT_ONLY_HEADER,
   LOCAL_ONLY_CSP,
-  cspReportOnlyHeaders,
+  cspHeaders,
   crossOriginIsolationHeaders,
 } from './csp-policy';
 
@@ -37,14 +38,24 @@ function foreignHostsIn(policy: string): string[] {
 }
 
 describe('LOCAL_ONLY_CSP (P-006)', () => {
-  it('is served REPORT-ONLY, never as the enforcing header', () => {
-    const headers = cspReportOnlyHeaders();
-    expect(Object.keys(headers)).toEqual([CSP_REPORT_ONLY_HEADER]);
+  it('is served ENFORCING, and the report-only phase is over', () => {
+    const headers = cspHeaders();
+    expect(Object.keys(headers)).toEqual([CSP_ENFORCING_HEADER]);
+    // Pinned to the LITERAL name rather than to CSP_HEADER: asserting the served
+    // header equals the constant it was read from is a tautology that would still
+    // pass if csp-policy.json regressed to report-only.
+    expect(CSP_HEADER).toBe('Content-Security-Policy');
+    expect(CSP_ENFORCING_HEADER).toBe('Content-Security-Policy');
+
+    // The report-only header must no longer appear in what we serve. This test
+    // previously asserted the EXACT OPPOSITE, gated on a stated release
+    // condition: "this policy has never been validated against a real session".
+    // P-005 clause 4 met that condition — 13 route/tab combinations in a live
+    // headless Tauri session, ~2,400 resource loads, zero foreign origins and
+    // zero violations, with the violation listener proven live per document
+    // against a reserved `.invalid` host before each verdict was recorded.
+    expect(Object.keys(headers)).not.toContain(CSP_REPORT_ONLY_HEADER);
     expect(CSP_REPORT_ONLY_HEADER).toBe('Content-Security-Policy-Report-Only');
-    // The enforcing header must not appear ANYWHERE in what we serve. Report-only
-    // cannot break the app; the enforcing one can, and this policy has never been
-    // validated against a real session.
-    expect(Object.keys(headers)).not.toContain(CSP_ENFORCING_HEADER);
   });
 
   it('names no foreign origin', () => {

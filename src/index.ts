@@ -104,9 +104,10 @@ export {
 // the SPA host and the desktop cannot drift apart on what "local" means.
 export {
   LOCAL_ONLY_CSP,
+  CSP_HEADER,
   CSP_REPORT_ONLY_HEADER,
   CSP_ENFORCING_HEADER,
-  cspReportOnlyHeaders,
+  cspHeaders,
 } from './csp-policy';
 export type {
   EndpointStreamEvent,
