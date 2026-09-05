@@ -103,6 +103,7 @@ export {
 // the monitor above which OBSERVES). One shared constant so the vite dev server,
 // the SPA host and the desktop cannot drift apart on what "local" means.
 export {
+  CODE_ORIGIN_ENFORCING_CSP,
   LOCAL_ONLY_CSP,
   CSP_HEADER,
   CSP_REPORT_ONLY_HEADER,

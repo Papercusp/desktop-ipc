@@ -1,11 +1,9 @@
 /**
  * The local-only CSP (egress-monitor-origin-axis-2026-08-02 P-006).
  *
- * The expensive mistake this file guards is not a typo in a directive — it is
- * shipping the ENFORCING header while believing it is report-only. That mistake
- * is invisible in review (the two constants differ by one word), it cannot be
- * caught by any test that only reads the policy STRING, and its symptom is the
- * desktop app silently failing to load assets in front of a user.
+ * The expensive mistake this file guards is collapsing two policies into one.
+ * D-002 requires code/content origins to enforce while strict `connect-src`
+ * remains report-only, because enforcing that connection rule breaks voice.
  *
  * The second guard is that the policy must not quietly acquire a foreign origin.
  * A CSP naming `https://cdn.example.com` is a POLICY-LEVEL blessing of exactly
@@ -14,6 +12,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  CODE_ORIGIN_ENFORCING_CSP,
   CSP_ENFORCING_HEADER,
   CSP_HEADER,
   CSP_REPORT_ONLY_HEADER,
@@ -37,25 +36,56 @@ function foreignHostsIn(policy: string): string[] {
     .filter((host) => !['localhost', '127.0.0.1', 'ipc.localhost'].includes(host));
 }
 
-describe('LOCAL_ONLY_CSP (P-006)', () => {
-  it('is served ENFORCING, and the report-only phase is over', () => {
+function directiveSources(policy: string, directive: string): string[] {
+  const directives = new Map(
+    policy.split(';').map((entry) => {
+      const [name, ...sources] = entry.trim().split(/\s+/);
+      return [name, sources] as const;
+    }),
+  );
+  return directives.get(directive) ?? directives.get('default-src') ?? [];
+}
+
+function permitsOrigin(policy: string, directive: string, origin: string): boolean {
+  const sources = directiveSources(policy, directive);
+  const scheme = new URL(origin).protocol;
+  return (
+    sources.includes(origin) ||
+    (sources.includes('*') && (scheme === 'http:' || scheme === 'https:')) ||
+    sources.includes(scheme) ||
+    (scheme === 'wss:' && sources.includes('ws:'))
+  );
+}
+
+describe('split desktop CSP (P-005 / D-002)', () => {
+  it('serves an enforcing code/content policy and a strict report-only connection policy', () => {
     const headers = cspHeaders();
-    expect(Object.keys(headers)).toEqual([CSP_ENFORCING_HEADER]);
-    // Pinned to the LITERAL name rather than to CSP_HEADER: asserting the served
-    // header equals the constant it was read from is a tautology that would still
-    // pass if csp-policy.json regressed to report-only.
+    expect(Object.keys(headers)).toEqual([CSP_ENFORCING_HEADER, CSP_REPORT_ONLY_HEADER]);
     expect(CSP_HEADER).toBe('Content-Security-Policy');
     expect(CSP_ENFORCING_HEADER).toBe('Content-Security-Policy');
-
-    // The report-only header must no longer appear in what we serve. This test
-    // previously asserted the EXACT OPPOSITE, gated on a stated release
-    // condition: "this policy has never been validated against a real session".
-    // P-005 clause 4 met that condition — 13 route/tab combinations in a live
-    // headless Tauri session, ~2,400 resource loads, zero foreign origins and
-    // zero violations, with the violation listener proven live per document
-    // against a reserved `.invalid` host before each verdict was recorded.
-    expect(Object.keys(headers)).not.toContain(CSP_REPORT_ONLY_HEADER);
     expect(CSP_REPORT_ONLY_HEADER).toBe('Content-Security-Policy-Report-Only');
+    expect(headers[CSP_ENFORCING_HEADER]).toBe(CODE_ORIGIN_ENFORCING_CSP);
+    expect(headers[CSP_REPORT_ONLY_HEADER]).toBe(LOCAL_ONLY_CSP);
+  });
+
+  it('keeps ElevenLabs signaling usable while the strict policy observes it', () => {
+    for (const origin of [
+      'https://api.elevenlabs.io',
+      'wss://livekit.rtc.elevenlabs.io',
+    ]) {
+      expect(permitsOrigin(CODE_ORIGIN_ENFORCING_CSP, 'connect-src', origin)).toBe(true);
+      expect(permitsOrigin(LOCAL_ONLY_CSP, 'connect-src', origin)).toBe(false);
+    }
+  });
+
+  it('still blocks foreign script and frame origins in the enforcing policy', () => {
+    const foreignOrigin = 'https://cdn.example.invalid';
+    for (const directive of ['script-src', 'frame-src']) {
+      expect(permitsOrigin(CODE_ORIGIN_ENFORCING_CSP, directive, foreignOrigin)).toBe(false);
+      // Negative control: the detector must fire when the code/content boundary
+      // is actually widened, rather than blessing every fixture by construction.
+      expect(permitsOrigin("default-src *; connect-src *", directive, foreignOrigin)).toBe(true);
+    }
   });
 
   it('names no foreign origin', () => {
@@ -101,7 +131,7 @@ describe('LOCAL_ONLY_CSP (P-006)', () => {
     }
   });
 
-  it('spells out connect-src with websocket schemes', () => {
+  it('spells out the strict report-only connect-src with websocket schemes', () => {
     // default-src does not reliably cover ws: across engines, so a same-origin
     // HMR/sync socket would otherwise report as a violation on every page load.
     expect(LOCAL_ONLY_CSP).toMatch(/connect-src[^;]*ws:\/\/localhost:\*/);

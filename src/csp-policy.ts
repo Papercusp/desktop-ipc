@@ -4,30 +4,22 @@ import cspPolicy from './csp-policy.json';
  * The Content-Security-Policy for a local-first desktop app
  * (egress-monitor-origin-axis-2026-08-02 P-006).
  *
- * THE POINT OF THIS FILE is the DESTINATION invariant, the same one
- * `egress-monitor.ts` observes: nothing may be fetched from a host we do not own.
- * The egress monitor OBSERVES violations after the fact; a CSP PREVENTS them.
- * That is why the plan calls them complementary legs (D-003) rather than
- * alternatives — and why this policy is deliberately permissive about
- * everything EXCEPT origin.
+ * THE POINT OF THIS FILE is to enforce the origin boundary for executable and
+ * rendered content while continuing to observe the stricter destination
+ * invariant for connections. Plan D-002 requires that split because the
+ * ElevenLabs voice path must signal over foreign HTTPS/WSS origins, while
+ * foreign script/frame/content must never execute inside trusted app chrome.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY IT IS ENFORCING NOW, AND WHY THE HEADER IS NOT SET FROM tauri.conf.json.
+ * WHY THE POLICY IS SPLIT, AND WHY IT IS NOT SET FROM tauri.conf.json.
  *
- * This policy shipped REPORT-ONLY first, deliberately: the enforcing header can
- * break the app, so it was gated on a release condition written into the test —
- * "this policy has never been validated against a real session".
- *
- * That condition is now met, which is what licensed this flip. Measured against
- * a live headless Tauri session (P-005 clause 4), navigating 13 route/tab
- * combinations including every family D-001 flagged as historically CDN-backed
- * (/editor-demo, /notes, /design, /cupboard — vditor, monaco, plantuml,
- * excalidraw): ~2,400 resource loads, ONE origin, zero foreign origins, zero
- * violations. The probe was proven live PER DOCUMENT rather than assumed — a
- * `securitypolicyviolation` listener re-installed on each navigation and
- * confirmed firing (controlSeen: 3) against a reserved `.invalid` host before
- * each route's verdict was recorded, because a zero from an unproven probe is
- * indistinguishable from a dead one.
+ * The code/content leg is enforcing after the P-005 live sweep proved the
+ * trusted routes clean. The connection leg remains report-only: an enforcing
+ * local-only `connect-src` blocks the ElevenLabs HTTPS/WSS signaling that D-001
+ * explicitly preserves. The enforcing policy therefore gives `connect-src` a
+ * wildcard while the paired report-only policy retains the local-only list.
+ * Naming the voice vendor in either policy is deliberately avoided: the
+ * observation policy stays vendor-neutral and detects every foreign destination.
  *
  * The header is still set by the servers rather than tauri.conf.json (D-004):
  * Tauri 2.11.3 exposes exactly one field, `pub csp: Option<Csp>`, and its own
@@ -35,7 +27,7 @@ import cspPolicy from './csp-policy.json';
  * shared JSON is what stops them drifting apart.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY IT IS PERMISSIVE ABOUT EVERYTHING EXCEPT ORIGIN.
+ * WHY BOTH POLICIES ARE PERMISSIVE ABOUT EXECUTION SHAPE.
  *
  * A textbook `default-src 'self'` also bans inline styles, `eval`, blob workers
  * and data: URIs. Those are all things this app legitimately does, and every one
@@ -47,8 +39,8 @@ import cspPolicy from './csp-policy.json';
  * So `'unsafe-inline'`, `'unsafe-eval'`, `blob:` and `data:` are ALLOWED here on
  * purpose. They are not an oversight and tightening them is a SEPARATE piece of
  * work with a separate rationale. This policy is scoped to answer exactly one
- * question — *did something contact a host we do not own?* — which makes every
- * report it produces actionable, and makes the eventual flip to enforcing safe.
+ * question — *did content come from, or a connection reach, a host we do not
+ * own?* — while D-002 decides which half is safe to enforce.
  */
 
 /**
@@ -58,21 +50,18 @@ import cspPolicy from './csp-policy.json';
  * report-only at all, and Tauri exposes no report-only field (D-004), which is
  * why the servers below set the header themselves rather than tauri.conf.json.
  */
-export const CSP_ENFORCING_HEADER = 'Content-Security-Policy';
+export const CSP_ENFORCING_HEADER: string = cspPolicy.enforcingHeader;
 
 /**
- * The header name this module actually serves, read from the shared JSON so the
- * three servers (vite dev, host-spa, and the Rust `papercusp:` protocol, which
- * `include_str!`s the same file) cannot drift apart. It is now the ENFORCING
- * name; the assertion that it equals CSP_ENFORCING_HEADER is pinned in the test.
+ * Compatibility alias for callers that historically imported the one served
+ * header. It remains the enforcing name; new code should use the explicit pair.
  */
-export const CSP_HEADER: string = cspPolicy.header;
+export const CSP_HEADER: string = CSP_ENFORCING_HEADER;
 
 /**
- * The report-only header name. Retained ONLY as the thing we assert we do NOT
- * serve — the report-only phase is over (see the flip note above).
+ * The report-only header name for the strict destination-observation leg.
  */
-export const CSP_REPORT_ONLY_HEADER = 'Content-Security-Policy-Report-Only';
+export const CSP_REPORT_ONLY_HEADER: string = cspPolicy.reportOnlyHeader;
 
 /**
  * Sources that are "ours" and therefore never egress. Mirrors the loopback
@@ -84,14 +73,22 @@ export const CSP_REPORT_ONLY_HEADER = 'Content-Security-Policy-Report-Only';
  * whatever an isolated e2e run picks).
  */
 /**
- * The policy. One directive: `default-src` covers every fetch directive that is
- * not otherwise specified, which is exactly the breadth we want — a foreign
- * script, style, image, font, frame, worker or fetch all report identically.
+ * The strict local-only policy retained under the report-only header. Its
+ * `default-src` covers content directives and its `connect-src` observes every
+ * non-local connection without blocking a preserved workflow.
  *
  * `connect-src` is spelled out separately ONLY because it must also carry the
  * websocket schemes; `default-src` does not reliably cover `ws:` across engines.
  */
-export const LOCAL_ONLY_CSP: string = cspPolicy.policy;
+export const LOCAL_ONLY_CSP: string = cspPolicy.reportOnlyPolicy;
+
+/**
+ * The enforcing code/content policy. `default-src` remains local-only, while an
+ * explicit wildcard `connect-src` prevents that fallback from blocking voice or
+ * another legitimate integration. The stricter connection rule lives in
+ * [`LOCAL_ONLY_CSP`] and reports the same request without enforcing it.
+ */
+export const CODE_ORIGIN_ENFORCING_CSP: string = cspPolicy.enforcingPolicy;
 
 /**
  * The header pair to attach to an SPA **document** response. A CSP applies to
@@ -99,7 +96,10 @@ export const LOCAL_ONLY_CSP: string = cspPolicy.policy;
  * accomplishes nothing.
  */
 export function cspHeaders(): Record<string, string> {
-  return { [CSP_HEADER]: LOCAL_ONLY_CSP };
+  return {
+    [CSP_ENFORCING_HEADER]: CODE_ORIGIN_ENFORCING_CSP,
+    [CSP_REPORT_ONLY_HEADER]: LOCAL_ONLY_CSP,
+  };
 }
 
 /**
