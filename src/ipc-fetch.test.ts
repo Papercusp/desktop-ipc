@@ -17,6 +17,24 @@ function aborting(): DispatchEndpointStreamFn {
 const dec = new TextDecoder();
 
 describe('ipcFetch', () => {
+  it.each([undefined, 'omit', 'same-origin', 'include'] as const)('forwards credential mode %s to the host cookie boundary', async credentials => {
+    let observed: unknown;
+    const dispatch: DispatchEndpointStreamFn = async function* (_toolName, input) {
+      observed = input;
+      yield { kind: 'event', name: 'head', data: { status: 204, headers: {} } };
+      yield { kind: 'done', result: { content: [] } };
+    };
+    await ipcFetch('/api/human-work', { credentials }, { dispatch });
+    expect(observed).toMatchObject({ credentials: credentials ?? 'same-origin' });
+  });
+
+  it('rejects an invalid credential mode without dispatching', async () => {
+    let dispatched = false;
+    const dispatch: DispatchEndpointStreamFn = async function* () { dispatched = true; };
+    await expect(ipcFetch('/api/x', { credentials: 'invalid' as RequestCredentials }, { dispatch })).rejects.toThrow('invalid credentials');
+    expect(dispatched).toBe(false);
+  });
+
   it('reassembles head + body chunks into a Response', async () => {
     const dispatch = dispatcher([
       {

@@ -18,9 +18,9 @@
  *    it as a `Last-Event-ID` header so resumable streams (sync SSE,
  *    log streams) keep their ring-buffer replay semantics.
  *
- * `withCredentials` is accepted for API compatibility but has no
- * effect — IPC has no cookies; the bridge's trust model synthesizes
- * the operator principal.
+ * `withCredentials` is accepted for API compatibility. All IPC requests
+ * target the same upstream origin, so the bridge's default same-origin
+ * credentials already use its connection-scoped, host-only cookie jar.
  */
 
 import { dispatchEndpointStreamIpc } from './ipc-stream';
