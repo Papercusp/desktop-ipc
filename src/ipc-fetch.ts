@@ -183,6 +183,10 @@ export async function ipcFetch(
   const dispatch = opts.dispatch ?? (dispatchEndpointStreamIpc as DispatchEndpointStreamFn);
 
   const path = pathFromUrl(typeof input === 'string' ? input : input.toString());
+  const credentials = init.credentials ?? 'same-origin';
+  if (!['omit', 'same-origin', 'include'].includes(credentials)) {
+    throw new TypeError('ipcFetch: invalid credentials mode');
+  }
 
   const headers: Record<string, string> = {};
   if (init.headers) {
@@ -221,6 +225,7 @@ export async function ipcFetch(
     path,
     headers,
     body,
+    credentials,
   };
 
   // A dropped IPC socket — most often the operator/sidecar restarting, whose
