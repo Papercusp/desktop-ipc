@@ -21,6 +21,7 @@
     "@papercusp/sse": "*"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "jsdom": "*",
     "vitest": "^4.1.4"
   }
