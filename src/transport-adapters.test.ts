@@ -5,6 +5,25 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { build } from 'esbuild';
+import { fileURLToPath } from 'node:url';
+
+describe('browser transport import boundary', () => {
+  it.each(['http-stream.ts', 'index.ts'])('bundles %s for the browser without server externals', async (entry) => {
+    const result = await build({
+      entryPoints: [fileURLToPath(new URL(entry, import.meta.url))],
+      bundle: true,
+      platform: 'browser',
+      format: 'esm',
+      write: false,
+      metafile: true,
+      logLevel: 'silent',
+    });
+    expect(result.outputFiles[0].text.length).toBeGreaterThan(0);
+    expect(Object.values(result.metafile.outputs).flatMap(output => output.imports)
+      .filter(dependency => dependency.external)).toEqual([]);
+  });
+});
 
 afterEach(() => {
   vi.resetModules();
